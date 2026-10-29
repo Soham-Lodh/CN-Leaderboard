@@ -1,0 +1,232 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider  = "postgresql"
+  url       = env("DATABASE_URL") // runtime (pooled) connection
+  directUrl = env("DIRECT_URL") // Prisma CLI / migrations use the direct URL
+}
+
+enum StaffStatus {
+  ACTIVE
+  REVOKED
+}
+
+enum GlobalRole {
+  PRESIDENT
+  VICE_PRESIDENT
+}
+
+enum DomainRole {
+  LEAD
+  CO_LEAD
+}
+
+enum MembershipStatus {
+  ACTIVE
+  REMOVED
+}
+
+enum ScoreSource {
+  MANUAL
+  IMPORT
+  CORRECTION
+}
+
+// ---------------------------------------------------------------
+// Staff & roles
+// ---------------------------------------------------------------
+
+model StaffAccount {
+  id        String      @id @default(uuid())
+  email     String      @unique @db.VarChar(320)
+  authUserId String?    @unique
+  displayName String?
+  status    StaffStatus @default(ACTIVE)
+  createdAt DateTime    @default(now())
+  updatedAt DateTime    @updatedAt
+  lastLoginAt DateTime?
+
+  globalRoleAssignments GlobalRoleAssignment[]
+  domainAssignments     DomainAssignment[]
+  scoreEntries          ScoreEntry[]
+  auditEvents           AuditEvent[]
+  idempotencyRecords    IdempotencyRecord[]
+  importBatches         ImportBatch[]
+
+  @@index([status])
+}
+
+// One current global role per staff account. Partial unique indexes
+// (added in the migration) enforce a single ACTIVE assignment.
+model GlobalRoleAssignment {
+  id             String     @id @default(uuid())
+  staffAccountId String
+  staffAccount   StaffAccount @relation(fields: [staffAccountId], references: [id])
+  role           GlobalRole
+  appointedById  String?
+  appointedAt    DateTime   @default(now())
+  revokedAt      DateTime?
+  revokedById    String?
+
+  @@index([staffAccountId, revokedAt])
+  @@index([role, revokedAt])
+}
+
+// Partial unique indexes in the migration enforce:
+//   - one active LEAD and one active CO_LEAD per domain
+//   - one active assignment per (domain, staff account)
+model DomainAssignment {
+  id             String        @id @default(uuid())
+  domainId       String
+  domain         Domain        @relation(fields: [domainId], references: [id])
+  staffAccountId String
+  staffAccount   StaffAccount  @relation(fields: [staffAccountId], references: [id])
+  role           DomainRole
+  appointedById  String?
+  appointedAt    DateTime      @default(now())
+  revokedAt      DateTime?
+  revokedById    String?
+
+  @@index([domainId, role, revokedAt])
+  @@index([staffAccountId, revokedAt])
+}
+
+// ---------------------------------------------------------------
+// Domains & members
+// ---------------------------------------------------------------
+
+model Domain {
+  id          String    @id @default(uuid())
+  name        String    @unique @db.VarChar(80)
+  slug        String    @unique @db.VarChar(80)
+  description String?
+  archivedAt  DateTime?
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  memberships  DomainMembership[]
+  assignments  DomainAssignment[]
+  importBatches ImportBatch[]
+  auditEvents   AuditEvent[]
+}
+
+model Member {
+  id                   String    @id @default(uuid())
+  name                 String    @db.VarChar(120)
+  rollNumber           String    @db.VarChar(60) // display value
+  normalizedRollNumber String    @unique @db.VarChar(60)
+  archivedAt           DateTime?
+  createdAt            DateTime  @default(now())
+  updatedAt            DateTime  @updatedAt
+  createdById          String?
+  updatedById          String?
+
+  memberships DomainMembership[]
+
+  @@index([archivedAt])
+}
+
+// Unique (domainId, memberId) prevents double enrollment. Balance is
+// always updated in the same transaction that writes ScoreEntry rows.
+model DomainMembership {
+  id            String           @id @default(uuid())
+  domainId      String
+  domain        Domain           @relation(fields: [domainId], references: [id])
+  memberId      String
+  member        Member           @relation(fields: [memberId], references: [id])
+  status        MembershipStatus @default(ACTIVE)
+  currentPoints Int              @default(0)
+  version       Int              @default(0)
+  createdAt     DateTime         @default(now())
+  updatedAt     DateTime         @updatedAt
+  createdById   String?
+  removedAt     DateTime?
+  removedById   String?
+
+  scoreEntries ScoreEntry[]
+
+  @@unique([domainId, memberId])
+  @@index([domainId, status, currentPoints(sort: Desc)])
+  @@index([memberId])
+}
+
+// ---------------------------------------------------------------
+// Immutable histories
+// ---------------------------------------------------------------
+
+model ScoreEntry {
+  id                  String  @id @default(uuid())
+  domainMembershipId  String
+  domainMembership    DomainMembership @relation(fields: [domainMembershipId], references: [id])
+  delta               Int
+  balanceAfter        Int
+  reason              String? @db.VarChar(200)
+  actorStaffAccountId String
+  actorStaffAccount   StaffAccount @relation(fields: [actorStaffAccountId], references: [id])
+  actorEmailSnapshot  String? @db.VarChar(320)
+  source              ScoreSource
+  idempotencyKey      String  @unique
+  createdAt           DateTime @default(now())
+
+  @@index([domainMembershipId, createdAt(sort: Desc)])
+  @@index([actorStaffAccountId, createdAt(sort: Desc)])
+}
+
+model AuditEvent {
+  id                  String   @id @default(uuid())
+  actorStaffAccountId String?
+  actorStaffAccount   StaffAccount? @relation(fields: [actorStaffAccountId], references: [id])
+  actorEmailSnapshot  String? @db.VarChar(320)
+  action              String   @db.VarChar(64)
+  targetType          String   @db.VarChar(32)
+  targetId            String
+  domainId            String?
+  domain              Domain?  @relation(fields: [domainId], references: [id])
+  beforeState         Json?
+  afterState          Json?
+  requestId           String   @db.VarChar(64)
+  metadata            Json?
+  createdAt           DateTime @default(now())
+
+  @@index([domainId, createdAt(sort: Desc)])
+  @@index([targetType, targetId, createdAt(sort: Desc)])
+  @@index([actorStaffAccountId, createdAt(sort: Desc)])
+  @@index([action, createdAt(sort: Desc)])
+}
+
+// Idempotency scope: (actor, client key, operation). Reserved before
+// locks are taken, completed in the same transaction as the write.
+model IdempotencyRecord {
+  id                  String  @id @default(uuid())
+  actorStaffAccountId String
+  actorStaffAccount   StaffAccount @relation(fields: [actorStaffAccountId], references: [id])
+  key                 String  @db.VarChar(72)
+  operation           String  @db.VarChar(32)
+  requestHash         String  @db.VarChar(64)
+  status              String  @db.VarChar(16) @default("RESERVED")
+  response            Json?
+  createdAt           DateTime @default(now())
+
+  @@unique([actorStaffAccountId, key, operation])
+  @@index([createdAt])
+}
+
+model ImportBatch {
+  id          String  @id @default(uuid())
+  domainId    String
+  domain      Domain  @relation(fields: [domainId], references: [id])
+  actorStaffAccountId String
+  actorStaffAccount StaffAccount @relation(fields: [actorStaffAccountId], references: [id])
+  filename    String  @db.VarChar(200)
+  contentHash String  @db.VarChar(64)
+  status      String  @db.VarChar(16)
+  membershipsCreated Int @default(0)
+  membershipsReactivated Int @default(0)
+  rowsSkipped Int     @default(0)
+  rowsInvalid Int     @default(0)
+  createdAt   DateTime @default(now())
+
+  @@index([domainId, createdAt(sort: Desc)])
+}
