@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { StaffContext } from "@/lib/auth/session";
-import { canAccessDomain, canAssignPoints, canManageGlobal, canViewAudit, canWriteDomain, readableDomainIds } from "@/lib/auth/policy";
+import { canAccessDomain, canAssignPoints, canManageGlobal, canViewAudit, canWriteDomain, readableDomainIds, canAppointGlobalRole, canRevokeGlobalRole, canAppointDomainRole, canManageMembers } from "@/lib/auth/policy";
 
 function staff(partial: Partial<StaffContext>): StaffContext {
   return {
@@ -53,6 +53,46 @@ describe("authorization policy (PRD §10: a lead cannot read or change another d
     const ctx = staff({ domainAssignments: [{ domainId: webDomain, role: "CO_LEAD" }] });
     expect(canWriteDomain(ctx, webDomain)).toBe(true);
     expect(canWriteDomain(ctx, otherDomain)).toBe(false);
+  });
+
+  it("global-role matrix: presidents manage presidents+VPs, VPs manage VPs only", () => {
+    const president = staff({ globalRole: "PRESIDENT", isGlobalLeader: true });
+    const vp = staff({ globalRole: "VICE_PRESIDENT", isGlobalLeader: true });
+    const lead = staff({ domainAssignments: [{ domainId: webDomain, role: "LEAD" }] });
+
+    expect(canAppointGlobalRole(president, "PRESIDENT")).toBe(true);
+    expect(canAppointGlobalRole(president, "VICE_PRESIDENT")).toBe(true);
+    expect(canRevokeGlobalRole(president, "PRESIDENT")).toBe(true);
+
+    expect(canAppointGlobalRole(vp, "VICE_PRESIDENT")).toBe(true);
+    expect(canAppointGlobalRole(vp, "PRESIDENT")).toBe(false);
+    expect(canRevokeGlobalRole(vp, "PRESIDENT")).toBe(false);
+
+    expect(canAppointGlobalRole(lead, "VICE_PRESIDENT")).toBe(false);
+    expect(canRevokeGlobalRole(lead, "VICE_PRESIDENT")).toBe(false);
+  });
+
+  it("domain leadership (lead/co-lead) is appointable by global leaders only", () => {
+    const president = staff({ globalRole: "PRESIDENT", isGlobalLeader: true });
+    const vp = staff({ globalRole: "VICE_PRESIDENT", isGlobalLeader: true });
+    const lead = staff({ domainAssignments: [{ domainId: webDomain, role: "LEAD" }] });
+
+    expect(canAppointDomainRole(president)).toBe(true);
+    expect(canAppointDomainRole(vp)).toBe(true);
+    expect(canAppointDomainRole(lead)).toBe(false);
+  });
+
+  it("member management: globals anywhere, leads/co-leads own domain only", () => {
+    const vp = staff({ globalRole: "VICE_PRESIDENT", isGlobalLeader: true });
+    const lead = staff({ domainAssignments: [{ domainId: webDomain, role: "LEAD" }] });
+    const coLead = staff({ domainAssignments: [{ domainId: otherDomain, role: "CO_LEAD" }] });
+
+    expect(canManageMembers(vp, webDomain)).toBe(true);
+    expect(canManageMembers(vp, otherDomain)).toBe(true);
+    expect(canManageMembers(lead, webDomain)).toBe(true);
+    expect(canManageMembers(lead, otherDomain)).toBe(false);
+    expect(canManageMembers(coLead, otherDomain)).toBe(true);
+    expect(canManageMembers(coLead, webDomain)).toBe(false);
   });
 
   it("keeps audit history hidden from leads and visible to globals", () => {

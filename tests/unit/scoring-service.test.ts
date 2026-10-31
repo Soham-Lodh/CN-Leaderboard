@@ -1,63 +1,99 @@
+import { randomUUID } from "node:crypto";
+import fs from "node:fs";
 import { describe, expect, it, beforeAll, afterAll } from "vitest";
 import type { AdjustScoreInput } from "@/lib/services/scoring";
 import type { StaffContext } from "@/lib/auth/session";
 
 /**
- * Integration test for the core concurrency guarantee (PRD §10: two
- * simultaneous assignments both persist with correct totals; a lead
- * cannot act outside their domain). Skipped wholesale when no database
- * is configured, so local unit runs stay hermetic and CI can enable it.
+ * Concurrency/authorization checks for the scoring service against a
+ * real database. The suite creates its OWN fixture (domain + member +
+ * membership, unique keys per run) and cleans up compensatingly, so it
+ * is safe to run against a shared database the owner opted into.
+ *
+ * No values from any env file are printed anywhere.
  */
 
-const hasDb = Boolean(process.env.DATABASE_URL);
-
-// server-only modules are loaded dynamically inside tests so vitest's
-// Node runtime never evaluates the guard module itself.
-let adjustScore!: (
-  ctx: StaffContext,
-  input: AdjustScoreInput,
-  corrId: string,
-) => Promise<ReturnType<Awaited<ReturnType<() => Promise<never>>>>> | unknown;
-
-async function loadSut(): Promise<void> {
-  if (!adjustScore) {
-    const mod = await import("@/lib/services/scoring");
-    adjustScore = mod.adjustScore as unknown as typeof adjustScore;
+// The vitest worker may not inherit the config-loaded .env; load the
+// project configuration explicitly.
+function ensureProjectEnv(): void {
+  try {
+    for (const rawLine of fs.readFileSync(".env", "utf8").split(/\r?\n/)) {
+      const line = rawLine.trim();
+      const eq = line.indexOf("=");
+      if (!line || line.startsWith("#") || eq <= 0) continue;
+      const key = line.slice(0, eq).trim();
+      if (!/^[A-Z0-9_]+$/.test(key)) continue;
+      const value = line
+        .slice(eq + 1)
+        .trim()
+        .replace(/^["']/, "")
+        .replace(/["']$/, "");
+      if (!(key in process.env)) process.env[key] = value;
+    }
+  } catch {
+    /* no .env */
   }
 }
+ensureProjectEnv();
+
+const hasDb = Boolean(process.env.TEST_DATABASE_URL ?? process.env.DATABASE_URL);
+
+type ScoringMod = typeof import("@/lib/services/scoring");
+type MembersMod = typeof import("@/lib/services/members");
+type Driver = typeof import("../integration/_driver");
+
+let adjustScore!: ScoringMod["adjustScore"];
+let driver!: Driver;
+let members!: MembersMod;
 
 let ctxLead: StaffContext;
 let ctxPresident: StaffContext;
-let domainA!: string;
-let domainB!: string;
+let domainA!: string; // lead's domain: holds the fixture membership
+let domainB!: string; // a different domain: lead must be refused here
+let fixtureMembershipId!: string;
 
-beforeAll(() => {
-  if (!hasDb) return;
-  domainA = process.env.__TEST_DOMAIN_A!;
-  domainB = process.env.__TEST_DOMAIN_B!;
-  ctxLead = {
-    staffAccountId: process.env.__TEST_LEAD_ID!,
-    email: "lead@kiit.ac.in",
-    displayName: "Lead",
-    globalRole: null,
-    domainAssignments: [{ domainId: domainA, role: "LEAD" }],
-    isGlobalLeader: false,
-  };
-  ctxPresident = {
-    staffAccountId: process.env.__TEST_PRESIDENT_ID!,
-    email: "president@kiit.ac.in",
-    displayName: "President",
-    globalRole: "PRESIDENT",
-    domainAssignments: [],
-    isGlobalLeader: true,
-  };
-});
+const created = { domainIds: [] as string[], staffEmails: [] as string[], memberIds: [] as string[] };
+let actorEmail = "";
+let leadEmail = "";
+const unique = () => `ut${Date.now().toString(36)}${randomUUID().slice(0, 8).replace(/-/g, "")}`;
+
+beforeAll(async () => {
+  ensureProjectEnv();
+  process.env.DATABASE_URL = (process.env.TEST_DATABASE_URL ?? process.env.DATABASE_URL) as string;
+  if (!process.env.DATABASE_URL) return;
+
+  driver = await import("../integration/_driver");
+  const scoringMod = await import("@/lib/services/scoring");
+  members = await import("@/lib/services/members");
+  adjustScore = scoringMod.adjustScore;
+
+  actorEmail = `unit-actor-${unique()}@example.edu`;
+  leadEmail = `unit-lead-${unique()}@example.edu`;
+  created.staffEmails.push(actorEmail, leadEmail);
+
+  domainA = (await driver.makeDomain(unique())).id;
+  domainB = (await driver.makeDomain(unique())).id;
+  created.domainIds.push(domainA, domainB);
+
+  ctxPresident = await driver.globalCtx(actorEmail);
+  ctxLead = await driver.leadCtx(leadEmail, domainA);
+
+  const roll = unique().toUpperCase(); // services uppercase-normalize rolls
+  const added = await members.addMemberWithMembership(
+    ctxPresident,
+    domainA,
+    { name: "Unit Scoring Probe", rollNumber: roll },
+    `key-fixture-${unique()}`,
+  );
+  if (!added.ok) throw new Error(`fixture member add failed: ${added.message}`);
+  created.memberIds.push(added.data.memberId);
+  fixtureMembershipId = added.data.membershipId;
+}, 60_000);
 
 afterAll(async () => {
   if (!hasDb) return;
-  const { prisma } = await import("@/lib/db");
-  await prisma.$disconnect();
-});
+  await driver.cleanup(created);
+}, 60_000);
 
 describe.skipIf(!hasDb)("scoring service (needs a running database)", () => {
   function input(membershipId: string, delta: number, key: string): AdjustScoreInput {
@@ -65,68 +101,62 @@ describe.skipIf(!hasDb)("scoring service (needs a running database)", () => {
   }
 
   it("refuses a lead assigning points in another domain", async () => {
-    await loadSut();
-    const { prisma } = await import("@/lib/db");
-    const membership = await prisma.domainMembership.findFirst({
-      where: { domainId: domainB, status: "ACTIVE" },
-      select: { id: true },
-    });
-    if (!membership) return; // requires the seed fixture to exercise this
-    const result = (await adjustScore(
-      ctxLead,
-      input(membership.id, 10, "5e6f1e34-aaaa-4bbb-8ccc-000000000001"),
-      "corr-1",
-    )) as { ok: boolean; code?: string };
-    expect(result.ok).toBe(false);
-    if (!result.ok) expect(result.code).toBe("FORBIDDEN");
-  });
-
-  it("persists two concurrent assignments with a correct summed total", async () => {
-    await loadSut();
-    const { prisma } = await import("@/lib/db");
-    const membership = await prisma.domainMembership.findFirst({
-      where: { domainId: domainA, status: "ACTIVE" },
-      select: { id: true, currentPoints: true },
-    });
-    if (!membership) return;
-    const start = membership.currentPoints;
-    const [a, b] = (await Promise.all([
-      adjustScore(ctxPresident, input(membership.id, 10, "22222222-2222-4222-8222-000000000001"), "corr-2"),
-      adjustScore(ctxPresident, input(membership.id, 25, "22222222-2222-4222-8222-000000000002"), "corr-3"),
-    ])) as [{ ok: boolean }, { ok: boolean }];
-    expect(a.ok).toBe(true);
-    expect(b.ok).toBe(true);
-    const total = await prisma.domainMembership.findUniqueOrThrow({
-      where: { id: membership.id },
-      select: { currentPoints: true },
-    });
-    expect(total.currentPoints).toBe(start + 35);
-  });
-
-  it("replays the same idempotency key as one event", async () => {
-    await loadSut();
-    const { prisma } = await import("@/lib/db");
-    const membership = await prisma.domainMembership.findFirst({
-      where: { domainId: domainA, status: "ACTIVE" },
-      select: { id: true },
-    });
-    if (!membership) return;
-    const key = "22222222-2222-4222-8222-000000000003";
-    const first = (await adjustScore(ctxPresident, input(membership.id, 5, key), "corr-4")) as {
-      ok: boolean;
-      data?: { currentPoints: number };
-    };
-    expect(first.ok).toBe(true);
-    if (first.ok && first.data) {
-      const replay = (await adjustScore(ctxPresident, input(membership.id, 5, key), "corr-5")) as {
-        ok: boolean;
-        data?: { replayed: boolean; currentPoints: number };
-      };
-      expect(replay.ok).toBe(true);
-      if (replay.ok && replay.data) {
-        expect(replay.data.replayed).toBe(true);
-        expect(replay.data.currentPoints).toBe(first.data.currentPoints);
+    const other = await members.listDomainMembers(domainB);
+    let membershipId: string | null = other.find((m) => m.status === "ACTIVE")?.membershipId ?? null;
+    if (!membershipId) {
+      // No member exists yet in domainB: create one owned by the actor.
+      const seed = await members.addMemberWithMembership(
+        ctxPresident,
+        domainB,
+        { name: "Unit Scoring Neighbor", rollNumber: unique().toUpperCase() },
+        `key-fixture-b-${unique()}`,
+      );
+      if (seed.ok) {
+        created.memberIds.push(seed.data.memberId);
+        membershipId = seed.data.membershipId;
       }
     }
-  });
+    if (!membershipId) return; // cannot exercise the refusal without a membership
+    const result = await adjustScore(ctxLead, input(membershipId, 10, randomUUID()), `corr-${unique()}`);
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.code).toBe("FORBIDDEN");
+  }, 45_000);
+
+  it("persists two concurrent assignments with a correct summed total", async () => {
+    const membership = await members.listDomainMembers(domainA);
+    const probe = membership.find((m) => m.membershipId === fixtureMembershipId && m.status === "ACTIVE");
+    if (!probe) return;
+    const start = probe.points;
+
+    const keyA = randomUUID();
+    const keyB = randomUUID();
+    const results = await Promise.all([
+      adjustScore(ctxLead, input(fixtureMembershipId, 10, keyA), `corr-${unique()}`),
+      adjustScore(ctxLead, input(fixtureMembershipId, 25, keyB), `corr-${unique()}`),
+    ]);
+    expect(results[0]!.ok).toBe(true);
+    expect(results[1]!.ok).toBe(true);
+
+    const total = await members.listDomainMembers(domainA);
+    const after = total.find((m) => m.membershipId === fixtureMembershipId);
+    expect(after?.points).toBe(start + 35); // no lost update
+  }, 45_000);
+
+  it("replays the same idempotency key as one event", async () => {
+    const membership = await members.listDomainMembers(domainA);
+    const probe = membership.find((m) => m.membershipId === fixtureMembershipId && m.status === "ACTIVE");
+    if (!probe) return;
+    // Fresh key per run: replaying is safe, re-running this test is not
+    // poisoned by a previous shared-database run's stored key.
+    const key = randomUUID();
+    const first = await adjustScore(ctxLead, input(fixtureMembershipId, 5, key), `corr-${unique()}`);
+    expect(first.ok, first.ok ? "scored" : `${first.code}: ${first.message}`).toBe(true);
+    const startPoints = first.ok ? first.data.currentPoints : undefined;
+    const replay = await adjustScore(ctxLead, input(fixtureMembershipId, 5, key), `corr-${unique()}`);
+    expect(replay.ok).toBe(true);
+    if (replay.ok && typeof startPoints === "number") {
+      expect(replay.data.replayed).toBe(true);
+      expect(replay.data.currentPoints).toBe(startPoints);
+    }
+  }, 45_000);
 });

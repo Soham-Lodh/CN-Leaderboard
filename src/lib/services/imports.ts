@@ -3,21 +3,36 @@ import ExcelJS from "exceljs";
 import { prisma } from "../db";
 import { invalidatePublicCaches } from "../cache";
 import { recordAudit } from "../audit";
-import { isTransientDbError, lockDomain, lockMembershipsSorted, setTransactionTimeouts, TX_OPTIONS } from "../locking";
+import {
+  isTransientDbError,
+  lockDomain,
+  lockMembersSorted,
+  lockMembershipsSorted,
+  setTransactionTimeouts,
+  TX_OPTIONS,
+} from "../locking";
 import { canAccessDomain } from "../auth/policy";
 import type { StaffContext } from "../auth/session";
 import { fail, ok, type ActionResult } from "../errors";
 import { requestHash, sha256Hex } from "../ids";
-import { cellIsFormula, normalizeRollNumber, type SheetCellLike } from "../normalize";
+import {
+  cellIsFormula,
+  mapImportHeader,
+  type ImportColumn,
+  normalizeRollNumber,
+  type SheetCellLike,
+} from "../normalize";
 import { MAX_REASON_LENGTH, MIN_DELTA, MAX_DELTA } from "../normalize";
 import { MAX_IMPORT_ROWS } from "../constants";
 import { sleepMs } from "../sleep";
+import { NotFoundSignal, mapDbWriteError } from "./domains";
 
 /**
  * Excel import for one domain (PRD FR-34..39, TRD §10.1). Parsing and
- * pure validation happen before any database transaction; commit is
- * idempotent by (actor, batch key) and re-parses the uploaded bytes so
- * nothing latent from the client is trusted.
+ * pure validation happen before any database transaction (parsing is
+ * never done while holding locks); the commit is idempotent by
+ * (actor, batch key) + content hash and re-parses the uploaded bytes
+ * so nothing latent from the client is trusted.
  */
 
 export interface ImportRowResult {
@@ -65,11 +80,11 @@ export async function previewImport(
   const file = await parseRawFile(rawFile);
   if (!file.ok) return fail("VALIDATION_ERROR", file.error);
 
-  const parsed = parseWorkbook(file.bytes);
+  const parsed = await parseWorkbook(file.bytes);
   if (!parsed.ok) return fail("VALIDATION_ERROR", parsed.error);
 
   const rolls = [...new Set(parsed.rows.map((r) => normalizeRollNumber(r.rollNumber ?? "")).filter((r) => r.length > 0))];
-  if (parsed.globalErrors.length > 0) {
+  if (rolls.length > 0 && parsed.globalErrors.length > 0) {
     return fail("VALIDATION_ERROR", parsed.globalErrors.join(" "));
   }
   if (ctx.isGlobalLeader && parsed.rows.some((r) => r.status !== "error" && r.points !== 0)) {
@@ -137,7 +152,7 @@ export async function commitImport(
   const file = await parseRawFile(rawFile);
   if (!file.ok) return fail("VALIDATION_ERROR", file.error);
 
-  const parsed = parseWorkbook(file.bytes);
+  const parsed = await parseWorkbook(file.bytes);
   if (!parsed.ok) return fail("VALIDATION_ERROR", parsed.error);
   if (parsed.globalErrors.length > 0) {
     return fail("VALIDATION_ERROR", parsed.globalErrors.join(" "));
@@ -161,12 +176,13 @@ export async function commitImport(
     } catch (error) {
       if (error instanceof StoredSummarySignal) return error.result;
       if (error instanceof ImportConflictSignal) return error.result;
+      if (error instanceof NotFoundSignal) return fail("NOT_FOUND", error.message);
       if (isTransientDbError(error) && attempt < 2) {
         attempt += 1;
         await sleepMs(60 * attempt);
         continue;
       }
-      throw error;
+      return mapDbWriteError(error);
     }
   }
 }
@@ -252,6 +268,27 @@ async function runImportTransaction(
       );
     const rolls = [...new Set(okRows.map((r) => normalizeRollNumber(r.rollNumber ?? "")))];
 
+    // 3. Resolve target rows, then lock EVERYTHING in hierarchy order
+    //    (members asc, then existing memberships asc) BEFORE writing
+    //    anything. Nothing in the sheet may mutate while the case analysis
+    //    below runs, so global-rules checks cannot stale.
+    const membersPre = rolls.length
+      ? await tx.member.findMany({
+          where: { normalizedRollNumber: { in: rolls } },
+          select: { id: true, normalizedRollNumber: true },
+        })
+      : [];
+    await lockMembersSorted(tx, membersPre.map((m) => m.id));
+
+    const membershipsPre = rolls.length
+      ? await tx.domainMembership.findMany({
+          where: { domainId, member: { normalizedRollNumber: { in: rolls } } },
+          select: { id: true, memberId: true },
+        })
+      : [];
+    await lockMembershipsSorted(tx, membershipsPre.map((m) => m.id));
+
+    // 4. Re-read the locked state before deciding (no pre-lock reads).
     const existingMembers = rolls.length
       ? await tx.member.findMany({
           where: { normalizedRollNumber: { in: rolls } },
@@ -281,7 +318,7 @@ async function runImportTransaction(
     const invalid = parsed.rows.filter((r) => r.status === "error").length;
     let scoredRows = 0;
 
-    /** Point updates queued for the locked flush below. */
+    /** Point updates flushed below, against membership rows locked above. */
     const pointUpdates: Array<{ membershipId: string; delta: number; reason: string | null }> = [];
 
     for (const row of okRows) {
@@ -379,13 +416,10 @@ async function runImportTransaction(
       }
     }
 
-    // Nonzero starting points → ledger entries in the same transaction.
-    // Memberships that pre-existed are locked in ascending id order first.
-    const existingUpdateIds = pointUpdates
-      .map((p) => p.membershipId)
-      .filter((id) => domainMemberships.some((m) => m.id === id));
-    await lockMembershipsSorted(tx, existingUpdateIds);
-
+    // 5. Nonzero starting/initial points → ledger entries in the same
+    //    transaction. Existing membership rows were already locked in
+    //    ascending id order at step 3 (lock-before-write, no re-locking);
+    //    newly created rows are private to this transaction.
     for (const p of pointUpdates) {
       const updated = await tx.domainMembership.update({
         where: { id: p.membershipId },
@@ -401,7 +435,7 @@ async function runImportTransaction(
           actorStaffAccountId: ctx.staffAccountId,
           actorEmailSnapshot: ctx.email,
           source: "IMPORT",
-          idempotencyKey: `${batchKey}:${p.membershipId.slice(0, 12)}`,
+          idempotencyKey: `${batchKey}:${p.membershipId}`,
         },
       });
       await recordAudit(tx, {
@@ -519,33 +553,16 @@ type ParseWorkbookResult =
   | ParsedWorkbook
   | { ok: false; error: string };
 
-const HEADER_ALIASES: Record<string, string> = {
-  name: "name",
-  rollnumber: "rollNumber",
-  "roll number": "rollNumber",
-  roll: "rollNumber",
-  points: "points",
-  initial_points: "points",
-  reason: "reason",
-};
-
-function headerKey(rawCell: ExcelJS.CellValue): ImportColumn | null {
-  let text: string;
-  if (typeof rawCell === "string") text = rawCell;
-  else if (rawCell === null || rawCell === undefined) return null;
-  else if (typeof rawCell === "object" && rawCell !== null && "text" in rawCell && typeof rawCell.text === "string") text = rawCell.text;
-  else return null;
-  const key = text.trim().toLowerCase().replace(/\s+/g, "");
-  return (HEADER_ALIASES[key] ?? HEADER_ALIASES[text.trim().toLowerCase()] ?? null) as ImportColumn | null;
-}
-
-type ImportColumn = "name" | "rollNumber" | "points" | "reason";
-
-function parseWorkbook(bytes: Buffer): ParseWorkbookResult {
+/**
+ * Parse an .xlsx workbook into validated rows. Async: `xlsx.load` is a
+ * Promise (loading it without awaiting left the workbook empty and made
+ * every upload fail). Parsed BEFORE any transaction.
+ */
+async function parseWorkbook(bytes: Buffer): Promise<ParseWorkbookResult> {
   const workbook = new ExcelJS.Workbook();
   let sheet: ExcelJS.Worksheet;
   try {
-    workbook.xlsx.load(bytes as unknown as ExcelJS.Buffer);
+    await workbook.xlsx.load(bytes as unknown as ExcelJS.Buffer);
     const loaded = workbook.worksheets[0];
     if (!loaded) return { ok: false, error: "The workbook has no worksheets" };
     sheet = loaded;
@@ -566,14 +583,17 @@ function parseWorkbook(bytes: Buffer): ParseWorkbookResult {
   let gotName = false;
   let gotRoll = false;
   headerRow.eachCell((cell, col) => {
-    const mapped = headerKey(cell.value);
+    const mapped = mapImportHeader(cell.value);
     if (!mapped) return;
     columnMap.set(col, mapped);
     if (mapped === "name") gotName = true;
     if (mapped === "rollNumber") gotRoll = true;
   });
   if (!gotName || !gotRoll) {
-    return { ok: false, error: "Header row must contain name and rollNumber columns" };
+    return {
+      ok: false,
+      error: "Header row must contain name and roll number columns (e.g. name, roll number)",
+    };
   }
 
   const seenRolls = new Map<string, number>();

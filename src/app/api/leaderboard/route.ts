@@ -31,6 +31,10 @@ export async function GET(request: NextRequest) {
   );
 
   return NextResponse.json(data, {
-    headers: { "s-maxage": "25", "stale-while-revalidate": "60" },
+    // Freshness comes from the Next data cache (25s TTL + immediate
+    // tag invalidation after writes). Middleware marks /api private
+    // no-store; an unsynchronized CDN s-maxage would keep stale
+    // results after mutations and is deliberately not emitted.
+    headers: { "cache-control": "private, no-store" },
   });
 }

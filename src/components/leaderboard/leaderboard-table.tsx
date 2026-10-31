@@ -12,17 +12,25 @@ export function LeaderboardTable({
   domainCount,
   query,
   pageParam,
+  selectedSlugs,
 }: {
   data: LeaderboardData;
   domains: Map<string, PublicDomain>;
   domainCount: number;
   query: string;
   pageParam: number;
+  selectedSlugs: string[];
 }) {
   const breakdown = domainCount > 1;
   const keepQuery = (page: number) => {
-    const value = query ? `&q=${encodeURIComponent(query)}` : "";
-    return `?page=${page}${value}`;
+    // Preserve the full query state (search + selected domains) across
+    // pagination — previously the domain selection was dropped and the
+    // table silently switched back to “all domains”.
+    const params = new URLSearchParams();
+    if (query) params.set("q", query);
+    if (selectedSlugs.length > 0) params.set("domains", selectedSlugs.join(","));
+    params.set("page", String(page));
+    return `?${params.toString()}`;
   };
 
   if (data.rows.length === 0) {
@@ -30,7 +38,11 @@ export function LeaderboardTable({
       <div className="rounded-xl border border-line bg-card px-6 py-16 text-center">
         <p className="text-sm font-medium">No members ranked yet</p>
         <p className="mt-1 text-sm text-muted">
-          {query ? "Try a different search." : "Points appear here once staff assign them."}
+          {pageParam > 1
+            ? `That page is beyond the current ranking (${data.totalPages} page${data.totalPages === 1 ? "" : "s"}). Continue from page 1.`
+            : query
+              ? "Try a different search."
+              : "Points appear here once staff assign them."}
         </p>
       </div>
     );

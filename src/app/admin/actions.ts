@@ -2,7 +2,7 @@
 
 import { revalidatePath } from "next/cache";
 import { adjustScore, validateScoreInput } from "@/lib/services/scoring";
-import { createDomain, renameDomain, setDomainArchived } from "@/lib/services/domains";
+import { createDomain, deleteDomain, renameDomain, setDomainArchived } from "@/lib/services/domains";
 import {
   addMemberWithMembership,
   renameMember,
@@ -41,7 +41,12 @@ export type AdminFormState = {
 
 function toFormState(result: ActionResult<unknown>): AdminFormState {
   if (!result.ok) {
-    return { status: "error", message: result.message, fields: result.fields };
+    return {
+      status: "error",
+      message: result.message,
+      fields: result.fields,
+      data: { code: result.code },
+    };
   }
   return { status: "ok", message: "Done." };
 }
@@ -112,6 +117,26 @@ export async function setDomainArchivedAction(_prev: AdminFormState, formData: F
   return { status: "error", message: result.message };
 }
 
+/**
+ * President/VP only: hard delete of a domain. Irreversible — requires
+ * the exact domain name again as confirmation, over and above the
+ * server-side guard and service checks.
+ */
+export async function deleteDomainAction(_prev: AdminFormState, formData: FormData): Promise<AdminFormState> {
+  const guard = await requireGlobalAction();
+  if (!guard.ok) return toFormState(guard);
+  const domainId = String(formData.get("domainId") ?? "");
+  if (!UUID.test(domainId)) return { status: "error", message: "Invalid domain." };
+  const confirmName = String(formData.get("confirmName") ?? "");
+  const corrId = newCorrelationId();
+  const result = await deleteDomain(guard.data, domainId, confirmName, corrId);
+  if (result.ok) {
+    invalidateAfterWrite(domainId);
+    return { status: "ok", message: "Domain deleted permanently." };
+  }
+  return { status: "error", message: result.message, fields: result.fields };
+}
+
 /* ------------------------------------------------------------------ */
 /* Members + memberships (domains staff are assigned to, or globals)   */
 /* ------------------------------------------------------------------ */
@@ -122,15 +147,27 @@ export async function addMemberAction(_prev: AdminFormState, formData: FormData)
   const domainId = String(formData.get("domainId") ?? "");
   if (!UUID.test(domainId)) return { status: "error", message: "Invalid domain." };
   const corrId = newCorrelationId();
-  const result = await addMemberWithMembership(guard.data, domainId, {
-    name: formText(formData, "name"),
-    rollNumber: formText(formData, "rollNumber"),
-  }, corrId);
+  const result = await addMemberWithMembership(
+    guard.data,
+    domainId,
+    {
+      name: formText(formData, "name"),
+      rollNumber: formText(formData, "rollNumber"),
+    },
+    corrId,
+    String(formData.get("idempotencyKey") ?? "") || undefined,
+  );
   if (result.ok) {
     invalidateAfterWrite(domainId);
     return {
       status: "ok",
-      message: result.data.reusedMember ? "Existing member returned to this domain." : "Member added.",
+      message: result.data.replayed
+        ? "Already recorded — no duplicate created."
+        : result.data.restoredMembership
+          ? "Membership restored for this member."
+          : result.data.reusedMember
+            ? "Existing member returned to this domain."
+            : "Member added.",
     };
   }
   return { status: "error", message: result.message, fields: result.fields };

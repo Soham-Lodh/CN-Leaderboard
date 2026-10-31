@@ -54,21 +54,25 @@ export function ImportPanel({ domainId, canViewAudit = false }: { domainId: stri
       <input type="hidden" name="batchKey" value={batchKey} />
       <div>
         <label htmlFor={inputId} className="block text-sm font-medium">
-          Members spreadsheet (.xlsx or .csv, max 1,000 rows)
+          Members spreadsheet (.xlsx, up to 500 data rows, max 5 MB)
         </label>
         <input
           id={inputId}
           type="file"
           name="file"
           required
-          accept=".xlsx,.csv"
+          accept=".xlsx,.xlsx"
           onChange={(e) => setFilePicked(e.target.files?.[0]?.name ?? null)}
           className="mt-1.5 block w-full text-sm file:mr-3 file:rounded-md file:border-0 file:bg-accent-soft file:px-3 file:py-2 file:text-sm file:font-semibold file:text-accent-dark"
         />
         <p className="mt-1 text-xs text-muted">
-          Columns: <code className="font-mono">name</code>, <code className="font-mono">roll_number</code>; optional{" "}
-          <code className="font-mono">initial_points</code>. Duplicates in the file, or members already active in this
-          domain, are reported and skipped.
+          Need a starting file? <a href="/admin/export/template" download className="font-medium text-accent-dark underline underline-offset-2">Download the template spreadsheet</a>.
+          First row must be headers: <code className="font-mono">name</code> and <code className="font-mono">roll number</code>{" "}
+          (accepts <code className="font-mono">roll number</code>, <code className="font-mono">roll_number</code>, and{" "}
+          <code className="font-mono">rollno</code> spellings too). Optional columns: <code className="font-mono">points</code>{" "}
+          (also <code className="font-mono">initial_points</code>, starting points for new/returned members) and{" "}
+          <code className="font-mono">reason</code>. Duplicates in the file, or members already active in this domain,
+          are reported and skipped. Formula cells are not allowed.
         </p>
       </div>
 
@@ -128,7 +132,7 @@ export function ImportPanel({ domainId, canViewAudit = false }: { domainId: stri
 
       {pending ? (
         <p aria-live="polite" className="text-xs text-muted">
-          Large files are parsed server-side; this can take a few seconds for 1,000 rows.
+          Files are parsed server-side; this can take a few seconds for 500 rows.
         </p>
       ) : null}
 

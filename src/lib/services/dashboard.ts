@@ -18,7 +18,9 @@ export async function getDashboardData(ctx: StaffContext): Promise<DashboardData
     prisma.domain.count({ where: { archivedAt: null } }),
     prisma.domainMembership.count({ where: { status: "ACTIVE", member: { archivedAt: null } } }),
     prisma.auditEvent.findMany({
-      where: canManageGlobal(ctx) ? {} : { id: "__hidden_for_domain_staff__" },
+      where: canManageGlobal(ctx)
+        ? {}
+        : { domainId: { in: ctx.domainAssignments.map((a) => a.domainId) } },
       orderBy: { createdAt: "desc" },
       take: 10,
       select: { id: true, action: true, createdAt: true, domain: { select: { name: true } } },

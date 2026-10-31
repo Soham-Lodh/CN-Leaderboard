@@ -27,7 +27,7 @@ export async function requireStaffPage(): Promise<StaffContext> {
 export async function requireGlobalStaffPage(): Promise<StaffContext> {
   const ctx = await requireStaffPage();
   if (!canManageGlobal(ctx)) {
-    redirect("/admin/dashboard");
+    redirect("/admin/forbidden");
   }
   return ctx;
 }
@@ -36,7 +36,7 @@ export async function requireGlobalStaffPage(): Promise<StaffContext> {
 export async function requireDomainManagerPage(domainId: string): Promise<StaffContext> {
   const ctx = await requireStaffPage();
   if (!canAccessDomain(ctx, domainId).allowed) {
-    redirect("/admin/dashboard");
+    redirect("/admin/forbidden");
   }
   return ctx;
 }

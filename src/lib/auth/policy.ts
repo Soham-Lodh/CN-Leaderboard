@@ -49,6 +49,41 @@ export function canViewAudit(ctx: StaffContext): boolean {
 }
 
 /**
+ * Global-role management matrix (product requirement):
+ *  - President may appoint/revoke PRESIDENT and VICE_PRESIDENT.
+ *  - Vice President may appoint/revoke VICE_PRESIDENT only — never a
+ *    President. The last-President invariant is enforced separately in
+ *    the service (advisory guard + post-lock re-read).
+ * Nobody else may manage global roles.
+ */
+export function canAppointGlobalRole(ctx: StaffContext, targetRole: GlobalRole): boolean {
+  if (ctx.globalRole === "PRESIDENT") return true;
+  return ctx.globalRole === "VICE_PRESIDENT" && targetRole === "VICE_PRESIDENT";
+}
+
+export function canRevokeGlobalRole(ctx: StaffContext, targetRole: GlobalRole): boolean {
+  return canAppointGlobalRole(ctx, targetRole);
+}
+
+/**
+ * Appointing/replacing LEAD or CO_LEAD on a domain: President and
+ * Vice President only — leads/co-leads of a domain may not reshuffle
+ * its leadership (they manage members instead, see canManageMembers).
+ */
+export function canAppointDomainRole(ctx: StaffContext): boolean {
+  return canManageGlobal(ctx);
+}
+
+/**
+ * Adding/removing members (their domain memberships): President/VP for
+ * any domain; LEAD/CO_LEAD for their own assigned domain only — this is
+ * canAccessDomain, expressed by name where the matrix matters.
+ */
+export function canManageMembers(ctx: StaffContext, domainId: string): boolean {
+  return canAccessDomain(ctx, domainId).allowed;
+}
+
+/**
  * Which domain ids the context may read audit history for: all domains
  * for global leaders, only assigned domains for scope staff.
  */

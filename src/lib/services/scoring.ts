@@ -9,6 +9,7 @@ import { requestHash } from "../ids";
 import {
   isTransientDbError,
   lockDomain,
+  lockMembersSorted,
   lockMembershipsSorted,
   setTransactionTimeouts,
   TX_OPTIONS,
@@ -161,6 +162,19 @@ async function runScoreTransaction(
 
     // 2. Domain lifecycle lock — FOR SHARE blocks a concurrent archive.
     await lockDomain(tx, domainId, "share");
+
+    // 2b. Lock the Member row BEFORE the membership row (hierarchy level
+    // 4 before 5): a concurrent archive/restore of this member now
+    // serializes on the member commit instead of racing this write.
+    const memberId = await tx.domainMembership
+      .findUnique({
+        where: { id: input.membershipId },
+        select: { memberId: true },
+      })
+      .then((m) => (m ? m.memberId : null));
+    if (memberId) {
+      await lockMembersSorted(tx, [memberId]);
+    }
 
     // 3. Lock + verify target membership state.
     await lockMembershipsSorted(tx, [input.membershipId]);

@@ -39,10 +39,18 @@ export async function getAuthContext(): Promise<StaffContext | null> {
   const normalized = normalizeEmail(user.email);
   if (!hasEmailSuffix(normalized, env().ALLOWED_EMAIL_DOMAIN)) return null;
 
-  // Prefer the trusted auth subject; fall back to the pre-provisioned email row.
+  // Resolve by the trusted auth subject first. The email fallback only
+  // applies while the provisioned row is unlinked; a row already linked
+  // to a DIFFERENT Google identity is left alone (no account takeover).
   let staff = await prisma.staffAccount.findFirst({
-    where: { OR: [{ authUserId: user.authUserId }, { email: normalized }], status: "ACTIVE" },
+    where: { authUserId: user.authUserId, status: "ACTIVE" },
   });
+  if (!staff) {
+    const byEmail = await prisma.staffAccount.findFirst({
+      where: { email: normalized, status: "ACTIVE" },
+    });
+    if (byEmail && byEmail.authUserId === null) staff = byEmail;
+  }
 
   if (!staff) return null; // unappointed or revoked staff: denied
 
@@ -94,9 +102,10 @@ export async function getVerifiedUser(): Promise<ResolvedUser | null> {
     if (!email) return null;
 
     // Supabase Auth only issues sessions for verified providers, but we
-    // still check the documented verification field defensively.
-    const confirmed = user.email_confirmed_at ?? user.confirmation_sent_at;
-    if (!confirmed) return null;
+    // still check the documented verification field defensively. Only a
+    // COMPLETED confirmation (email_confirmed_at) counts —
+    // confirmation_sent_at merely proves a verification mail was sent.
+    if (!user.email_confirmed_at) return null;
 
     return {
       authUserId: user.id,

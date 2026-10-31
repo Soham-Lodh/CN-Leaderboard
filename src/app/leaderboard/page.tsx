@@ -5,7 +5,7 @@ import { listActiveDomains, getLeaderboard, LEADERBOARD_PAGE_SIZE } from "@/lib/
 import { leaderboardQuerySchema } from "@/lib/validation";
 
 /**
- * No metadata: the leaderboard is a live operational page served
+ * The leaderboard is a live operational page served
  * without login and must not be indexed (PRD success criteria: SEO
  * content is rendered server-side, but search engines are told to
  * skip this page; sitemap lists only the welcome page).
@@ -60,6 +60,7 @@ export default async function LeaderboardPage({
         domainCount={selected.length}
         query={parsed.q ?? ""}
         pageParam={parsed.page}
+        selectedSlugs={parsed.domains && parsed.domains.length > 0 ? parsed.domains.split(",") : []}
       />
 
       {data.rows.length > 0 && data.page === 1 ? (

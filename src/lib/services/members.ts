@@ -2,12 +2,20 @@ import "server-only";
 import { prisma } from "../db";
 import { invalidatePublicCaches } from "../cache";
 import { recordAudit } from "../audit";
-import { lockDomain, lockMembershipsSorted, setTransactionTimeouts, TX_OPTIONS } from "../locking";
+import {
+  isUniqueViolation,
+  lockDomain,
+  lockMembersSorted,
+  lockMembershipsSorted,
+  setTransactionTimeouts,
+  TX_OPTIONS,
+} from "../locking";
 import { canAccessDomain, canManageGlobal } from "../auth/policy";
 import type { StaffContext } from "../auth/session";
 import { fail, zodToResult, ok, type ActionResult } from "../errors";
 import { ZodError } from "zod";
 import { memberInputSchema } from "../validation";
+import { requestHash } from "../ids";
 import { NotFoundSignal, mapDbWriteError } from "./domains";
 
 export interface MembershipBadgeDto {
@@ -87,48 +95,139 @@ export async function listPeople(
   };
 }
 
-/** Add a member with a membership in one domain (creator-scoped). */
+export interface AddMemberResult {
+  memberId: string;
+  membershipId: string;
+  /** An existing Member row was reused (possibly restored). */
+  reusedMember: boolean;
+  /** An existing REMOVED membership was restored instead of created. */
+  restoredMembership: boolean;
+  replayed: boolean;
+}
+
+/**
+ * Add a member with a membership in one domain.
+ *
+ * Concurrency + idempotency:
+ *  - Reserves the idempotency key (actor + key + "MEMBER_ADDED") first;
+ *    a retried request with the same payload replays the committed
+ *    result, a same-key/different-payload request conflicts.
+ *  - Follows the lock hierarchy: domain FOR SHARE -> Member FOR UPDATE
+ *    (when it exists) -> DomainMembership FOR UPDATE; state is re-read
+ *    after each lock wait.
+ *  - Concurrent manual adds of the same roll number resolve to one
+ *    Member row; the loser's transaction retries once and restores/
+ *    joins cleanly instead of surfacing a raw constraint error.
+ */
 export async function addMemberWithMembership(
   ctx: StaffContext,
   domainId: string,
   raw: unknown,
   corrId: string,
-): Promise<ActionResult<{ memberId: string; membershipId: string; reusedMember: boolean }>> {
+  idempotencyKey?: string,
+): Promise<ActionResult<AddMemberResult>> {
   const access = canAccessDomain(ctx, domainId);
   if (!access.allowed) return fail("FORBIDDEN", "You are not assigned to this domain");
   const parsed = memberInputSchema.safeParse(raw);
   if (!parsed.success) return zodToResult(parsed.error as ZodError);
   const { name, rollNumber } = parsed.data;
 
-  try {
-    const result = await prisma.$transaction(async (tx) => {
-      await setTransactionTimeouts(tx);
-      await lockDomain(tx, domainId, "share");
-      const domain = await tx.domain.findUnique({ where: { id: domainId } });
-      if (!domain || domain.archivedAt) throw new NotFoundSignal("Domain not found or archived");
+  const keyPattern = /^[0-9a-f-]{8,72}$/i;
+  const key = idempotencyKey && keyPattern.test(idempotencyKey)
+    ? idempotencyKey
+    : `am-${crypto.randomUUID()}`;
+  const hash = requestHash({
+    operation: "MEMBER_ADDED",
+    actor: ctx.staffAccountId,
+    domainId,
+    name,
+    rollNumber,
+  });
 
-      let member = await tx.member.findUnique({ where: { normalizedRollNumber: rollNumber } });
-      let reusedMember = member !== null;
-      if (!member) {
-        member = await tx.member.create({
-          data: {
-            name,
-            rollNumber,
-            normalizedRollNumber: rollNumber,
-            createdById: ctx.staffAccountId,
-          },
-        });
-        await recordAudit(tx, {
-          action: "MEMBER_CREATED",
-          targetType: "Member",
-          targetId: member.id,
+  let attempt = 0;
+  for (;;) {
+    try {
+      const result = await runAddMemberTransaction(ctx, domainId, name, rollNumber, key, hash, corrId);
+      invalidatePublicCaches([domainId]);
+      return result;
+    } catch (error) {
+      if (error instanceof NotFoundSignal) {
+        return fail("NOT_FOUND", error.message);
+      }
+      // Two simultaneous creations race on the Member unique index; the
+      // loser retries once and resolves via the winner's committed row.
+      if (isUniqueViolation(error) && attempt < 1) {
+        attempt += 1;
+        continue;
+      }
+      return mapDbWriteError(error);
+    }
+  }
+}
+
+async function runAddMemberTransaction(
+  ctx: StaffContext,
+  domainId: string,
+  name: string,
+  rollNumber: string,
+  key: string,
+  hash: string,
+  corrId: string,
+): Promise<ActionResult<AddMemberResult>> {
+  return prisma.$transaction(async (tx) => {
+    await setTransactionTimeouts(tx);
+
+    // 1. Idempotency reservation (one logical manual addition).
+    const stored = await tx.idempotencyRecord.findUnique({
+      where: {
+        actorStaffAccountId_key_operation: {
           actorStaffAccountId: ctx.staffAccountId,
-          actorEmailSnapshot: ctx.email,
-          domainId,
-          afterState: { name, rollNumber },
-          requestId: corrId,
-        });
-      } else if (member.archivedAt) {
+          key,
+          operation: "MEMBER_ADDED",
+        },
+      },
+    });
+    if (stored) {
+      if (stored.requestHash !== hash) {
+        return fail(
+          "IDEMPOTENCY_CONFLICT",
+          "This idempotency key was used for a different request",
+        );
+      }
+      if (stored.status === "COMMITTED") {
+        const response = stored.response as AddMemberResult | null;
+        if (response) return ok({ ...response, replayed: true });
+      }
+      // RESERVED previously (timed out/abandoned): reuse it.
+    } else {
+      await tx.idempotencyRecord.create({
+        data: {
+          actorStaffAccountId: ctx.staffAccountId,
+          key,
+          operation: "MEMBER_ADDED",
+          requestHash: hash,
+          status: "RESERVED",
+        },
+      });
+    }
+
+    // 2. Domain lifecycle lock; the domain must still exist and be active.
+    await lockDomain(tx, domainId, "share");
+    const domain = await tx.domain.findUnique({
+      where: { id: domainId },
+      select: { id: true, archivedAt: true },
+    });
+    if (!domain) return fail("NOT_FOUND", "Domain not found");
+    if (domain.archivedAt) return fail("CONFLICT", "This domain is archived. Restore it first.");
+
+    // 3. Resolve + lock the Member row (hierarchy level 4).
+    let member = await tx.member.findUnique({ where: { normalizedRollNumber: rollNumber } });
+    const reusedMember = member !== null;
+    if (member) {
+      await lockMembersSorted(tx, [member.id]);
+      // Re-read after the lock wait: an archive/restore may have landed.
+      member = await tx.member.findUnique({ where: { id: member!.id } });
+      if (member && member.archivedAt) {
         member = await tx.member.update({
           where: { id: member.id },
           data: { archivedAt: null, updatedById: ctx.staffAccountId },
@@ -142,37 +241,128 @@ export async function addMemberWithMembership(
           domainId,
           requestId: corrId,
         });
-        reusedMember = true;
       }
-
-      const membership = await tx.domainMembership.create({
+    }
+    if (!member) {
+      member = await tx.member.create({
         data: {
-          domainId,
-          memberId: member.id,
-          status: "ACTIVE",
+          name,
+          rollNumber,
+          normalizedRollNumber: rollNumber,
           createdById: ctx.staffAccountId,
         },
       });
       await recordAudit(tx, {
-        action: "MEMBERSHIP_ADDED",
+        action: "MEMBER_CREATED",
+        targetType: "Member",
+        targetId: member.id,
+        actorStaffAccountId: ctx.staffAccountId,
+        actorEmailSnapshot: ctx.email,
+        domainId,
+        afterState: { name, rollNumber },
+        requestId: corrId,
+      });
+    }
+
+    // 4. Resolve + lock the existing membership (level 5), then decide.
+    const membershipId = await lockMembershipForMember(tx, domainId, member.id);
+    const membership = membershipId
+      ? await tx.domainMembership.findUnique({ where: { id: membershipId } })
+      : null;
+
+    if (membership?.status === "ACTIVE") {
+      return fail("CONFLICT", `“${member.name}” is already an active member of this domain.`);
+    }
+
+    if (membership) {
+      // Previously REMOVED: restore it — never duplicate the row.
+      await tx.domainMembership.update({
+        where: { id: membership.id },
+        data: { status: "ACTIVE", removedAt: null, removedById: null },
+      });
+      await recordAudit(tx, {
+        action: "MEMBERSHIP_RESTORED",
         targetType: "DomainMembership",
         targetId: membership.id,
         actorStaffAccountId: ctx.staffAccountId,
         actorEmailSnapshot: ctx.email,
         domainId,
-        afterState: { memberId: member.id, rollNumber },
+        beforeState: { status: membership.status },
+        afterState: { status: "ACTIVE" },
         requestId: corrId,
       });
+      const response: AddMemberResult = {
+        memberId: member.id,
+        membershipId: membership.id,
+        reusedMember,
+        restoredMembership: true,
+        replayed: false,
+      };
+      await markIdempotencyCommitted(tx, ctx.staffAccountId, key, response);
+      return ok(response);
+    }
 
-      return { memberId: member.id, membershipId: membership.id, reusedMember };
-    }, TX_OPTIONS);
+    const created = await tx.domainMembership.create({
+      data: {
+        domainId,
+        memberId: member.id,
+        status: "ACTIVE",
+        createdById: ctx.staffAccountId,
+      },
+    });
+    await recordAudit(tx, {
+      action: "MEMBERSHIP_ADDED",
+      targetType: "DomainMembership",
+      targetId: created.id,
+      actorStaffAccountId: ctx.staffAccountId,
+      actorEmailSnapshot: ctx.email,
+      domainId,
+      afterState: { memberId: member.id, rollNumber },
+      requestId: corrId,
+    });
+    const response: AddMemberResult = {
+      memberId: member.id,
+      membershipId: created.id,
+      reusedMember,
+      restoredMembership: false,
+      replayed: false,
+    };
+    await markIdempotencyCommitted(tx, ctx.staffAccountId, key, response);
+    return ok(response);
+  }, TX_OPTIONS);
+}
 
-    invalidatePublicCaches([domainId]);
-    return ok(result);
-  } catch (error) {
-    if (error instanceof NotFoundSignal) return fail("NOT_FOUND", error.message);
-    return mapDbWriteError(error);
-  }
+/** Lock the (domain, member) membership row, returning its id, if any. */
+async function lockMembershipForMember(
+  tx: Parameters<Parameters<typeof prisma.$transaction>[0]>[0],
+  domainId: string,
+  memberId: string,
+): Promise<string | null> {
+  const found = await tx.domainMembership.findUnique({
+    where: { domainId_memberId: { domainId, memberId } },
+    select: { id: true },
+  });
+  if (!found) return null;
+  await lockMembershipsSorted(tx, [found.id]);
+  return found.id;
+}
+
+async function markIdempotencyCommitted(
+  tx: Parameters<Parameters<typeof prisma.$transaction>[0]>[0],
+  actorStaffAccountId: string,
+  key: string,
+  response: AddMemberResult,
+): Promise<void> {
+  await tx.idempotencyRecord.update({
+    where: {
+      actorStaffAccountId_key_operation: {
+        actorStaffAccountId,
+        key,
+        operation: "MEMBER_ADDED",
+      },
+    },
+    data: { status: "COMMITTED", response: response as unknown as object },
+  });
 }
 
 export interface DomainMemberRow {
@@ -187,16 +377,17 @@ export interface DomainMemberRow {
 
 export async function listDomainMembers(domainId: string): Promise<DomainMemberRow[]> {
   const members = await prisma.domainMembership.findMany({
-    where: { domainId, member: { archivedAt: null } },
+    where: { domainId },
     select: {
       id: true,
       status: true,
       currentPoints: true,
-      member: { select: { id: true, name: true, rollNumber: true } },
+      member: { select: { id: true, name: true, rollNumber: true, archivedAt: true } },
     },
     orderBy: [{ status: "asc" }, { currentPoints: "desc" }, { member: { name: "asc" } }],
   });
   return members
+    .filter((m) => m.member.archivedAt === null)
     .map((m) => ({
       membershipId: m.id,
       memberId: m.member.id,
@@ -205,8 +396,7 @@ export async function listDomainMembers(domainId: string): Promise<DomainMemberR
       points: m.currentPoints,
       status: m.status,
       memberArchived: false as const,
-    }))
-    .filter((m) => m.status === "ACTIVE");
+    }));
 }
 
 /** Rename a member; any domain manager of a domain the member is active in may act. */
@@ -221,20 +411,26 @@ export async function renameMember(
   if (!/^[0-9a-f-]{36}$/i.test(membershipId)) return fail("VALIDATION_ERROR", "Invalid membership id");
 
   try {
+    // Resolve membership -> member first (plain read for authorization).
+    const membership = await prisma.domainMembership.findUnique({
+      where: { id: membershipId },
+      select: { id: true, domainId: true, memberId: true },
+    });
+    if (!membership || !canAccessDomain(ctx, membership.domainId).allowed) {
+      return fail("NOT_FOUND", "Membership not found");
+    }
+
     const result = await prisma.$transaction(async (tx) => {
       await setTransactionTimeouts(tx);
-      await lockMembershipsSorted(tx, [membershipId]);
-      const membership = await tx.domainMembership.findUnique({
-        where: { id: membershipId },
-        include: { member: true, domain: true },
-      });
-      if (!membership) throw new NotFoundSignal("Membership not found");
-      if (!canAccessDomain(ctx, membership.domainId).allowed) {
-        throw new NotFoundSignal("Membership not found");
-      }
-      const before = membership.member.name;
+      // Lock the Member row (level 4): two renames through different
+      // memberships of the same member serialize here (no lost update).
+      await lockMembersSorted(tx, [membership.memberId]);
+      await lockMembershipsSorted(tx, [membership.id]);
+      const member = await tx.member.findUnique({ where: { id: membership.memberId } });
+      if (!member) throw new NotFoundSignal("Member not found");
+      const before = member.name;
       const updated = await tx.member.update({
-        where: { id: membership.memberId },
+        where: { id: member.id },
         data: { name: parsed.data, updatedById: ctx.staffAccountId },
       });
       await recordAudit(tx, {
@@ -248,7 +444,7 @@ export async function renameMember(
         afterState: { name: parsed.data },
         requestId: corrId,
       });
-      return { memberId: updated.id, name: updated.name, domainId: membership.domainId };
+      return { memberId: updated.id, name: updated.name };
     }, TX_OPTIONS);
 
     invalidatePublicCaches([]);
@@ -270,9 +466,17 @@ export async function setMembershipStatus(
   try {
     const result = await prisma.$transaction(async (tx) => {
       await setTransactionTimeouts(tx);
-      await lockMembershipsSorted(tx, [membershipId]);
-      const membership = await tx.domainMembership.findUnique({
+      // Pre-read for authorization, then lock (level 5) and re-read.
+      const found = await tx.domainMembership.findUnique({
         where: { id: membershipId },
+        select: { id: true, domainId: true },
+      });
+      if (!found || !canAccessDomain(ctx, found.domainId).allowed) {
+        throw new NotFoundSignal("Membership not found");
+      }
+      await lockMembershipsSorted(tx, [found.id]);
+      const membership = await tx.domainMembership.findUnique({
+        where: { id: found.id },
         select: {
           id: true,
           status: true,
@@ -281,9 +485,7 @@ export async function setMembershipStatus(
           member: { select: { rollNumber: true } },
         },
       });
-      if (!membership || !canAccessDomain(ctx, membership.domainId).allowed) {
-        throw new NotFoundSignal("Membership not found");
-      }
+      if (!membership) throw new NotFoundSignal("Membership not found");
       const target: "ACTIVE" | "REMOVED" = remove ? "REMOVED" : "ACTIVE";
       if (membership.status === target) {
         return { membershipId: membership.id, status: membership.status, domainId: membership.domainId };
@@ -332,12 +534,15 @@ export async function setMemberArchived(
   try {
     const result = await prisma.$transaction(async (tx) => {
       await setTransactionTimeouts(tx);
+      // Lock the Member row (level 4) and re-read: archive vs score/
+      // membership mutations now serialize deterministically.
+      await lockMembersSorted(tx, [memberId]);
       const member = await tx.member.findUnique({ where: { id: memberId } });
       if (!member) throw new NotFoundSignal("Member not found");
-      if ((member.archivedAt !== null) === archived) return member;
+      if ((member.archivedAt !== null) === archived) return member; // idempotent
       const updated = await tx.member.update({
         where: { id: memberId },
-        data: archived ? { archivedAt: new Date() } : { archivedAt: null, updatedById: undefined },
+        data: archived ? { archivedAt: new Date() } : { archivedAt: null },
       });
       await recordAudit(tx, {
         action: archived ? "MEMBER_ARCHIVED" : "MEMBER_RESTORED",

@@ -2,8 +2,8 @@ import "server-only";
 import { prisma } from "../db";
 import { env } from "../env";
 import { recordAudit } from "../audit";
-import { setTransactionTimeouts, lockGlobalRolesFor, TX_OPTIONS } from "../locking";
-import { canManageGlobal } from "../auth/policy";
+import { acquirePresidentGuard, setTransactionTimeouts, lockGlobalRolesFor, TX_OPTIONS } from "../locking";
+import { canAppointGlobalRole, canManageGlobal, canRevokeGlobalRole } from "../auth/policy";
 import type { StaffContext } from "../auth/session";
 import { fail, ok, type ActionResult } from "../errors";
 import { hasEmailSuffix, normalizeEmail } from "../normalize";
@@ -151,6 +151,9 @@ export async function appointGlobalRole(
   corrId: string,
 ): Promise<ActionResult<{ staffId: string; role: GlobalRole }>> {
   if (!canManageGlobal(ctx)) return fail("FORBIDDEN", "Global leadership role required");
+  if (!canAppointGlobalRole(ctx, role)) {
+    return fail("FORBIDDEN", "Only a President can appoint Presidents");
+  }
   const email = normalizeEmail(typeof rawEmail === "string" ? rawEmail : "");
   if (!isStaffEmail(email)) {
     return fail("VALIDATION_ERROR", "Institutional email required");
@@ -159,13 +162,36 @@ export async function appointGlobalRole(
   try {
     const result = await prisma.$transaction(async (tx) => {
       await setTransactionTimeouts(tx);
+      // Hierarchy level 1: a transaction-scoped advisory lock serializes
+      // every global-role mutation so the last-President invariant is
+      // protected against concurrent revoke/appoint combinations.
+      await acquirePresidentGuard(tx);
+
       const target = await findOrCreateStaffForAppointment(tx, email, ctx, corrId);
+
+      // Lock the target's current active role row (level 6), then read it.
+      await lockGlobalRolesFor(tx, [target.id]);
       const existingActive = await tx.globalRoleAssignment.findFirst({
         where: { staffAccountId: target.id, revokedAt: null },
+        select: { id: true, role: true },
       });
       if (existingActive) {
         if (existingActive.role === role) {
-          throw new ConflictSignal(`${role === "PRESIDENT" ? "President" : "Vice President"} already holds this role`);
+          throw new ConflictSignal(
+            `${role === "PRESIDENT" ? "President" : "Vice President"} already holds this role`,
+          );
+        }
+        // Revolving door guard: converting the ONLY active President to
+        // a Vice President would leave the chapter leaderless.
+        if (existingActive.role === "PRESIDENT" && role === "VICE_PRESIDENT") {
+          const presidentCount = await tx.globalRoleAssignment.count({
+            where: { revokedAt: null, role: "PRESIDENT" },
+          });
+          if (presidentCount <= 1) {
+            throw new ConflictSignal(
+              "The last active President cannot be moved to Vice President. Appoint a replacement President first.",
+            );
+          }
         }
         await tx.globalRoleAssignment.update({
           where: { id: existingActive.id },
@@ -208,8 +234,11 @@ export async function appointGlobalRole(
 
 /**
  * Revoke an active global role. A revoked President can never leave the
- * chapter with zero active Presidents; the check runs under row locks
- * on all active global role rows.
+ * chapter with zero active Presidents. The decision runs AFTER the
+ * locks: all active role rows are locked in ascending staff-id order and
+ * the president set is re-read inside the transaction — the previous
+ * read-before-lock version could approve a revocation against stale
+ * data while a concurrent appointment landed.
  */
 export async function revokeGlobalRole(
   ctx: StaffContext,
@@ -222,23 +251,41 @@ export async function revokeGlobalRole(
   try {
     const result = await prisma.$transaction(async (tx) => {
       await setTransactionTimeouts(tx);
+      // Hierarchy level 1 first (see appointGlobalRole).
+      await acquirePresidentGuard(tx);
+
       const assignment = await tx.globalRoleAssignment.findUnique({
         where: { id: assignmentId },
         select: { id: true, staffAccountId: true, role: true, revokedAt: true },
       });
       if (!assignment) throw new NotFoundSignal("Assignment not found");
+      // Matrix: a VP may revoke Vice Presidents, never a President.
+      // Checked under the guard + row read, before any write.
+      if (!canRevokeGlobalRole(ctx, assignment.role)) {
+        throw new ForbiddenSignal("Only a President can revoke a President");
+      }
       if (assignment.revokedAt) {
         return { revoked: true, activePresidents: -1, alreadyRevoked: true };
       }
 
+      // Lock ALL active role rows (level 6), then re-read the state the
+      // invariant depends on. Postgres holds these row locks until commit.
       const active = await tx.globalRoleAssignment.findMany({
         where: { revokedAt: null },
         select: { id: true, staffAccountId: true, role: true },
       });
       await lockGlobalRolesFor(tx, active.map((a) => a.staffAccountId));
+      const activeReRead = await tx.globalRoleAssignment.findMany({
+        where: { revokedAt: null },
+        select: { id: true, staffAccountId: true, role: true },
+      });
 
-      const presidentIds = active.filter((a) => a.role === "PRESIDENT");
-      if (assignment.role === "PRESIDENT" && presidentIds.length <= 1) {
+      const assignmentNow = activeReRead.find((a) => a.id === assignmentId);
+      if (!assignmentNow) {
+        throw new ConflictSignal("This assignment was revoked concurrently; refresh to continue.");
+      }
+      const presidentIds = activeReRead.filter((a) => a.role === "PRESIDENT");
+      if (assignmentNow.role === "PRESIDENT" && presidentIds.length <= 1) {
         throw new ConflictSignal(
           "The last active President cannot be removed. Appoint a replacement first.",
         );
@@ -254,7 +301,7 @@ export async function revokeGlobalRole(
         targetId: assignmentId,
         actorStaffAccountId: ctx.staffAccountId,
         actorEmailSnapshot: ctx.email,
-        beforeState: { role: assignment.role, staffAccountId: assignment.staffAccountId },
+        beforeState: { role: assignmentNow.role, staffAccountId: assignmentNow.staffAccountId },
         requestId: corrId,
       });
 
@@ -268,6 +315,7 @@ export async function revokeGlobalRole(
   } catch (error) {
     if (error instanceof ConflictSignal) return fail("CONFLICT", error.message);
     if (error instanceof NotFoundSignal) return fail("NOT_FOUND", error.message);
+    if (error instanceof ForbiddenSignal) return fail("FORBIDDEN", error.message);
     throw error;
   }
 }
@@ -294,6 +342,16 @@ export async function appointDomainRole(
       if (!domain) throw new NotFoundSignal("Domain not found");
 
       const target = await findOrCreateStaffForAppointment(tx, email, ctx, corrId);
+      // Lock this domain's existing role rows in stable order before
+      // revoking/creating, then re-read to decide under fresh state.
+      const domainAssignments = await tx.domainAssignment.findMany({
+        where: { domainId, revokedAt: null },
+        select: { id: true, staffAccountId: true, role: true },
+      });
+      if (domainAssignments.length > 0) {
+        const ids = domainAssignments.map((a) => a.id).sort();
+        await tx.$queryRaw`SELECT id FROM "DomainAssignment" WHERE id = ANY(${ids}::text[]) ORDER BY id FOR UPDATE`;
+      }
       const sameStaffActive = await tx.domainAssignment.findFirst({
         where: { domainId, staffAccountId: target.id, revokedAt: null },
       });
@@ -391,5 +449,12 @@ class NotFoundSignal extends Error {
   constructor(message: string) {
     super(message);
     this.name = "NotFoundSignal";
+  }
+}
+
+class ForbiddenSignal extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "ForbiddenSignal";
   }
 }

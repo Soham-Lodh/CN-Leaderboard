@@ -40,14 +40,15 @@ export interface LeaderboardData {
   rows: PublicLeaderboardRow[];
 }
 
-async function listActiveDomainsUncached(): Promise<PublicDomain[]> {
-  return prisma.domain.findMany({
+const listActiveDomainsUncached = async (): Promise<PublicDomain[]> =>
+  prisma.domain.findMany({
     where: { archivedAt: null },
     orderBy: [{ name: "asc" }],
     select: { id: true, name: true, slug: true },
   });
-}
 
+// Hoisted: the cachePublic wrapper is created once at module scope —
+// recreating it per call wasted allocations on every request.
 export const listActiveDomains: () => Promise<PublicDomain[]> = cachePublic(
   listActiveDomainsUncached,
   "public-domains",
@@ -61,7 +62,6 @@ interface AggRow {
   points: number;
   name: string;
   roll: string;
-  total: number;
 }
 
 async function getLeaderboardUncached(
@@ -86,35 +86,63 @@ async function getLeaderboardUncached(
     : "";
   const args: unknown[] = hasSearch ? [ids, searchLike, rollLike] : [ids];
 
-  const rowsAndTotal = await prisma.$queryRawUnsafe<AggRow[]>(
-    `WITH selected AS (
-       SELECT dm."memberId" AS member_id, dm."currentPoints" AS points
-       FROM "DomainMembership" dm
-       JOIN "Domain" d ON d.id = dm."domainId" AND d."archivedAt" IS NULL
-       JOIN "Member" m ON m.id = dm."memberId" AND m."archivedAt" IS NULL
-       WHERE dm.status = 'ACTIVE' AND dm."domainId" = ANY($1::text[])
-     ), agg AS (
-       SELECT member_id, SUM(points)::int AS points FROM selected GROUP BY member_id
-     ), filtered AS (
-       SELECT agg.member_id, agg.points, mem.name, mem."normalizedRollNumber" AS roll
-       FROM agg
-       JOIN "Member" mem ON mem.id::text = agg.member_id AND mem."archivedAt" IS NULL
-       ${searchClause}
-     ), ranked AS (
-       SELECT *, ROW_NUMBER() OVER (
-         ORDER BY points DESC, roll ASC, name ASC, member_id ASC
-       ) AS rank
-       FROM filtered
-     )
-     SELECT rank::int, member_id, points, name, roll, COUNT(*) OVER ()::int AS total
-     FROM ranked
-     LIMIT ${LEADERBOARD_PAGE_SIZE} OFFSET ${(page - 1) * LEADERBOARD_PAGE_SIZE}`,
-    ...args,
-  );
+  const [rowsPage, totalRows] = await Promise.all([
+    prisma.$queryRawUnsafe<AggRow[]>(
+      `WITH selected AS (
+         SELECT dm."memberId" AS member_id, dm."currentPoints" AS points
+         FROM "DomainMembership" dm
+         JOIN "Domain" d ON d.id = dm."domainId" AND d."archivedAt" IS NULL
+         JOIN "Member" m ON m.id = dm."memberId" AND m."archivedAt" IS NULL
+         WHERE dm.status = 'ACTIVE' AND dm."domainId" = ANY($1::text[])
+       ), agg AS (
+         SELECT member_id, SUM(points)::int AS points FROM selected GROUP BY member_id
+       ), filtered AS (
+         SELECT agg.member_id, agg.points, mem.name, mem."normalizedRollNumber" AS roll
+         FROM agg
+         JOIN "Member" mem ON mem.id::text = agg.member_id AND mem."archivedAt" IS NULL
+         ${searchClause}
+       ), ranked AS (
+         SELECT *, ROW_NUMBER() OVER (
+           ORDER BY points DESC, roll ASC, name ASC, member_id ASC
+         ) AS rank
+         FROM filtered
+       )
+       SELECT rank::int, member_id, points, name, roll
+       FROM ranked
+       LIMIT ${LEADERBOARD_PAGE_SIZE} OFFSET ${(page - 1) * LEADERBOARD_PAGE_SIZE}`,
+      ...args,
+    ),
+    // Separate COUNT: `COUNT(*) OVER ()` reports zero when a page is
+    // out of range, which collapsed pagination ("Total: 0"). The count
+    // query is independent of the page offset.
+    prisma
+      .$queryRawUnsafe<{ total: number }[]>(
+        `WITH selected AS (
+           SELECT dm."memberId" FROM "DomainMembership" dm
+           JOIN "Domain" d ON d.id = dm."domainId" AND d."archivedAt" IS NULL
+           JOIN "Member" m ON m.id = dm."memberId" AND m."archivedAt" IS NULL
+           WHERE dm.status = 'ACTIVE' AND dm."domainId" = ANY($1::text[])
+         ), agg AS (
+           SELECT member_id FROM selected GROUP BY member_id
+         ), filtered AS (
+           SELECT agg.member_id, mem.name, mem."normalizedRollNumber" AS roll
+           FROM agg
+           JOIN "Member" mem ON mem.id::text = agg.member_id AND mem."archivedAt" IS NULL
+           ${searchClause}
+         )
+         SELECT COUNT(*)::int AS total FROM filtered`,
+        ...args,
+      )
+      .then((r) => r[0]?.total ?? 0),
+  ]);
 
-  // Compact scores-only breakdown when more than one domain is selected.
+  const pageMemberIds = rowsPage.map((r) => r.member_id);
+
+  // Compact scores-only breakdown when more than one domain is selected,
+  // restricted to the members on THIS page (previously it aggregated
+  // every membership in every selected domain).
   const breakdownRows =
-    ids.length > 1
+    ids.length > 1 && pageMemberIds.length > 0
       ? await prisma.$queryRaw<{ member_id: string; domain_id: string; points: number }[]>`
       SELECT s.member_id AS member_id, s.domain_id AS domain_id, SUM(s.points)::int AS points
       FROM (
@@ -123,6 +151,7 @@ async function getLeaderboardUncached(
         JOIN "Domain" d ON d.id = dm."domainId" AND d."archivedAt" IS NULL
         JOIN "Member" m ON m.id = dm."memberId" AND m."archivedAt" IS NULL
         WHERE dm.status = 'ACTIVE' AND dm."domainId" = ANY(${ids}::text[])
+          AND dm."memberId" = ANY(${pageMemberIds}::text[])
       ) s
       GROUP BY 1, 2`
       : [];
@@ -134,8 +163,7 @@ async function getLeaderboardUncached(
     breakdownByMember.set(b.member_id, list);
   }
 
-  const totalMembers = rowsAndTotal[0]?.total ?? 0;
-  const rows: PublicLeaderboardRow[] = rowsAndTotal.map((r) => ({
+  const rows: PublicLeaderboardRow[] = rowsPage.map((r) => ({
     memberId: r.member_id,
     name: r.name,
     rollNumber: r.roll,
@@ -147,28 +175,30 @@ async function getLeaderboardUncached(
   return {
     page,
     pageSize: LEADERBOARD_PAGE_SIZE,
-    totalMembers,
-    totalPages: Math.max(1, Math.ceil(totalMembers / LEADERBOARD_PAGE_SIZE)),
+    totalMembers: totalRows,
+    totalPages: Math.max(1, Math.ceil(totalRows / LEADERBOARD_PAGE_SIZE)),
     rows,
   };
 }
 
-/**
- * Cached public leaderboard. unstable_cache includes the call arguments
- * in the cache key so domain set/mode/page are distinct entries; tags
- * allow immediate invalidation after mutations and the TTL only bounds
- * staleness as a fallback.
- */
+// Hoisted for the same reason as listActiveDomains: unstable_cache keys
+// include the call arguments, so one module-scope wrapper serves every
+// domain set / search / page combination. Invalidation works because
+// every committed mutation revalidates the shared
+// CACHE_TAGS.leaderboard tag (see invalidatePublicCaches); the short
+// TTL is only a fallback.
+const getLeaderboardCached = cachePublic(
+  getLeaderboardUncached,
+  "public-leaderboard",
+  [CACHE_TAGS.leaderboard],
+  PUBLIC_LEADERBOARD_TTL_SECONDS,
+);
+
+/** Cached public leaderboard. */
 export function getLeaderboard(
   domainIds: string[],
   q: string | undefined,
   page: number,
-) {
-  const cached = cachePublic(
-    getLeaderboardUncached,
-    "public-leaderboard",
-    [CACHE_TAGS.leaderboard, ...domainIds.map((d) => CACHE_TAGS.domain(d))],
-    PUBLIC_LEADERBOARD_TTL_SECONDS,
-  );
-  return cached(domainIds, q, page);
+): Promise<LeaderboardData> {
+  return getLeaderboardCached(domainIds, q, page);
 }

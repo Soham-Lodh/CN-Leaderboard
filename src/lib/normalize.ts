@@ -87,6 +87,60 @@ export function cellIsFormula(cell: SheetCellLike): boolean {
   return false;
 }
 
+/**
+ * Spreadsheet header contract (import/export must match exactly).
+ * Required columns: name, roll number. Optional: points, reason.
+ * Recognized spellings per column — case/whitespace/underscore
+ * variations are normalized away.
+ */
+export type ImportColumn = "name" | "rollNumber" | "points" | "reason";
+
+export const IMPORT_HEADER_ALIASES: Readonly<Record<string, ImportColumn>> = {
+  name: "name",
+  "full name": "name",
+  membername: "name",
+  rollnumber: "rollNumber",
+  "roll number": "rollNumber",
+  roll_no: "rollNumber",
+  rollno: "rollNumber",
+  roll: "rollNumber",
+  points: "points",
+  initial_points: "points",
+  reason: "reason",
+};
+
+/**
+ * Map a raw spreadsheet header cell to the canonical column name.
+ * Returns null for unrecognized headers.
+ */
+export function mapImportHeader(rawCell: unknown): ImportColumn | null {
+  let text: string;
+  if (typeof rawCell === "string") {
+    text = rawCell;
+  } else if (rawCell === null || rawCell === undefined || typeof rawCell !== "object") {
+    return null;
+  } else if (
+    "text" in (rawCell as Record<string, unknown>) &&
+    typeof (rawCell as { text?: unknown }).text === "string"
+  ) {
+    text = (rawCell as { text: string }).text;
+  } else {
+    return null;
+  }
+  const flat = text.trim().toLowerCase();
+  if (flat.length === 0) return null;
+  const squeezed = flat.replace(/[\s_-]+/g, "");
+  return IMPORT_HEADER_ALIASES[flat] ?? IMPORT_HEADER_ALIASES[squeezed] ?? null;
+}
+
+/** Import column labels, used by UI instructions and the template file. */
+export const IMPORT_COLUMNS: Array<{ column: ImportColumn; label: string; required: boolean }> = [
+  { column: "name", label: "name", required: true },
+  { column: "rollNumber", label: "roll number", required: true },
+  { column: "points", label: "points", required: false },
+  { column: "reason", label: "reason", required: false },
+];
+
 /** Deterministic JSON serialization for canonical request hashes. */
 export function canonicalize(value: unknown): string {
   if (value === null || typeof value !== "object") return JSON.stringify(value) ?? "null";

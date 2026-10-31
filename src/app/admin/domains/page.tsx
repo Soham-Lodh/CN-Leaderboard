@@ -6,7 +6,7 @@ import { listAdminDomains } from "@/lib/services/domains";
 import { AdminShell } from "@/components/admin/shell";
 import { Card, Badge, SectionTitle } from "@/components/ui";
 import { ActionForm } from "@/components/admin/action-form";
-import { createDomainAction, renameDomainAction, setDomainArchivedAction } from "../actions";
+import { createDomainAction, deleteDomainAction, renameDomainAction, setDomainArchivedAction } from "../actions";
 
 export const metadata: Metadata = { title: "Domains · Staff", robots: { index: false, follow: false } };
 
@@ -87,6 +87,27 @@ export default async function AdminDomainsPage() {
                       ? "Restoring makes the domain publicly visible again."
                       : "Archiving hides the domain from the public leaderboard. Members and their scores are kept."}
                   </p>
+                <ActionForm action={deleteDomainAction} submitLabel="Delete permanently" className="space-y-2 sm:col-span-2">
+                  <input type="hidden" name="domainId" value={d.id} />
+                  <label className="block space-y-1">
+                    <span className="text-xs font-medium">Type the exact domain name to confirm deletion</span>
+                    <input
+                      name="confirmName"
+                      required
+                      maxLength={80}
+                      autoComplete="off"
+                      aria-label={`Type ${d.name} to confirm permanent deletion`}
+                      placeholder={d.name}
+                      className="input-base"
+                    />
+                  </label>
+                  <p className="text-xs text-muted">
+                    Deletes this domain and everything tied to it — memberships, staff assignments,
+                    import batches and this domain’s score records — irreversibly. Members that belong
+                    to no other domain are removed as well. Preserved audit history is unlinked from
+                    the domain. Use Archive instead to keep domain data. President/VP only.
+                  </p>
+                </ActionForm>
                 </ActionForm>
               </div>
             </Card>

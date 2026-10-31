@@ -1,6 +1,6 @@
 "use client";
 
-import { useActionState } from "react";
+import { useEffect, useActionState } from "react";
 import type { AdminFormState } from "@/app/admin/actions";
 
 /**
@@ -15,6 +15,8 @@ export function ActionForm({
   className,
   successTone = "plain",
   resetOnSuccess = false,
+  onSuccess,
+  onIdempotencyConflict,
 }: {
   action: (state: AdminFormState, formData: FormData) => Promise<AdminFormState>;
   children: React.ReactNode;
@@ -22,8 +24,27 @@ export function ActionForm({
   className?: string;
   successTone?: "plain" | "accent";
   resetOnSuccess?: boolean;
+  /** Called once when this form commits successfully (e.g. close a modal). */
+  onSuccess?: () => void;
+  /** Called when the server reports the idempotency key was reused for a
+      different payload; the caller should regenerate the key. */
+  onIdempotencyConflict?: () => void;
 }) {
   const [state, formAction, pending] = useActionState(action, { status: "idle", message: "" });
+
+  useEffect(() => {
+    if (state.status === "ok" && onSuccess) onSuccess();
+    // The callback regenerating the idempotency key for a retry must
+    // run before this form can be submitted again; it is idempotent.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [state.status]);
+
+  useEffect(() => {
+    if (state.status === "error" && (state.data?.code as string | undefined) === "IDEMPOTENCY_CONFLICT" && onIdempotencyConflict) {
+      onIdempotencyConflict();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [state]);
 
   return (
     <form action={formAction} className={className}>

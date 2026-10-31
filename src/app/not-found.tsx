@@ -9,12 +9,20 @@ export default function NotFound() {
       <div className="w-full max-w-xl">
         <HeroLogo />
       </div>
-      <Link
-        href="/leaderboard"
-        className="rounded-lg bg-accent px-5 py-2.5 text-sm font-semibold text-white transition-colors hover:bg-accent-dark"
-      >
-        Go to leaderboard
-      </Link>
+      <div className="flex flex-wrap items-center justify-center gap-3">
+        <Link
+          href="/"
+          className="min-h-11 rounded-lg bg-accent px-5 py-2.5 text-sm font-semibold text-white transition-colors hover:bg-accent-dark"
+        >
+          Go home
+        </Link>
+        <Link
+          href="/leaderboard"
+          className="min-h-11 rounded-lg border border-line px-5 py-2.5 text-sm font-semibold text-ink transition-colors hover:bg-accent-soft"
+        >
+          Leaderboard
+        </Link>
+      </div>
     </div>
   );
 }

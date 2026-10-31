@@ -1,3 +1,4 @@
+import type { Metadata } from "next";
 import Link from "next/link";
 import { ArrowRight } from "lucide-react";
 import { HeroLogo } from "@/components/ui";
@@ -7,6 +8,20 @@ import { siteUrl } from "@/lib/env";
  * Public welcome page. Fully static — no database reads. Metadata is
  * indexable; the leaderboard deliberately is not (PRD §10).
  */
+export const metadata: Metadata = {
+  title: "Coding Ninjas KIIT Chapter",
+  description: "Chapter member leaderboard across our domains — ranks, points, and achievements updated as staff assign points.",
+  alternates: { canonical: "/" },
+  openGraph: {
+    title: "Coding Ninjas KIIT Chapter",
+    description: "Chapter member leaderboard across our domains — ranks, points, and achievements updated as staff assign points.",
+    type: "website",
+    url: "/",
+    images: [{ url: "/branding/coding-ninjas-kiit.webp", width: 1200, height: 630, alt: "Coding Ninjas KIIT Chapter" }],
+  },
+  twitter: { card: "summary_large_image", title: "Coding Ninjas KIIT Chapter", description: "Chapter member leaderboard across our domains — ranks, points, and achievements updated as staff assign points.", images: ["/branding/coding-ninjas-kiit.webp"] },
+};
+
 export default function HomePage() {
   return (
     <div className="mx-auto flex min-h-screen w-full max-w-4xl flex-col px-6">

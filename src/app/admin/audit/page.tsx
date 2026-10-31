@@ -91,7 +91,7 @@ export default async function AdminAuditPage({ searchParams }: PageProps) {
         </Card>
       ) : (
         <Card>
-          <table className="w-full text-sm">
+          <div className="overflow-x-auto"><table className="w-full min-w-[720px] text-sm">
             <caption className="sr-only">Members in {domain.name} with total points</caption>
             <thead>
               <tr className="text-left text-xs font-semibold uppercase tracking-wide text-faint">
@@ -119,7 +119,7 @@ export default async function AdminAuditPage({ searchParams }: PageProps) {
                 </tr>
               ))}
             </tbody>
-          </table>
+          </table></div>
         </Card>
       )}
 
@@ -137,7 +137,7 @@ export default async function AdminAuditPage({ searchParams }: PageProps) {
             </Card>
           ) : (
             <Card>
-              <table className="w-full text-sm">
+              <div className="overflow-x-auto"><table className="w-full min-w-[720px] text-sm">
                 <caption className="sr-only">Append-only score changes for {ledger.data.memberName}</caption>
                 <thead>
                   <tr className="text-left text-xs font-semibold uppercase tracking-wide text-faint">
@@ -162,7 +162,7 @@ export default async function AdminAuditPage({ searchParams }: PageProps) {
                     </tr>
                   ))}
                 </tbody>
-              </table>
+              </table></div>
               <p className="mt-2 text-xs text-faint">Showing up to 200 events; corrections are appended as new rows.</p>
             </Card>
           )}

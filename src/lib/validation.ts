@@ -77,6 +77,16 @@ export const renameDomainSchema = z.object({
   name: domainNameSchema,
 });
 
+/**
+ * Hard delete of a domain. confirmName must match the domain's exact
+ * current name (checked against the locked row in the service) so a
+ * stray click can never erase a domain.
+ */
+export const deleteDomainSchema = z.object({
+  domainId: z.string().uuid(),
+  confirmName: z.string().trim().min(1).max(80),
+});
+
 export const memberInputSchema = z.object({
   name: memberNameSchema,
   rollNumber: rawRollSchema,
