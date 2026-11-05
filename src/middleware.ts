@@ -57,8 +57,17 @@ export async function middleware(request: NextRequest) {
   return response;
 }
 
+/**
+ * Session refresh runs only where authentication is actually used:
+ * the staff area, the OAuth entry/exit/auth callback routes, and API
+ * routes that resolve the caller themselves.
+ *
+ * Public pages (welcome, leaderboard) never read auth in their render,
+ * so refreshing Supabase sessions on those requests added a network
+ * round trip per page view for anonymous visitors (the majority of
+ * traffic) with no benefit. Protected pages still verify server-side
+ * (page guards + route handlers), so authorization is unchanged.
+ */
 export const config = {
-  matcher: [
-    "/((?!_next/static|_next/image|branding|favicon.ico|robots.txt|sitemap.xml|manifest.json).*)",
-  ],
+  matcher: ["/admin", "/admin/:path*", "/auth/:path*", "/api/:path*"],
 };

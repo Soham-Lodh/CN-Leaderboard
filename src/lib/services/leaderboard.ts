@@ -118,7 +118,7 @@ async function getLeaderboardUncached(
     prisma
       .$queryRawUnsafe<{ total: number }[]>(
         `WITH selected AS (
-           SELECT dm."memberId" FROM "DomainMembership" dm
+           SELECT dm."memberId" AS member_id FROM "DomainMembership" dm
            JOIN "Domain" d ON d.id = dm."domainId" AND d."archivedAt" IS NULL
            JOIN "Member" m ON m.id = dm."memberId" AND m."archivedAt" IS NULL
            WHERE dm.status = 'ACTIVE' AND dm."domainId" = ANY($1::text[])

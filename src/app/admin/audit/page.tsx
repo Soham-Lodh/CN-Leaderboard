@@ -1,5 +1,6 @@
 import type { Metadata } from "next";
 import Link from "next/link";
+import { Suspense } from "react";
 import { ArrowRight } from "lucide-react";
 import { requireStaffPage } from "@/lib/auth/guards";
 import { canManageGlobal, readableDomainIds } from "@/lib/auth/policy";
@@ -8,6 +9,7 @@ import { listDomainAuditMembers } from "@/lib/services/audit-queries";
 import { getMembershipLedger } from "@/lib/services/scoring";
 import { AdminShell } from "@/components/admin/shell";
 import { Badge, Card, ScoreValue, SectionTitle } from "@/components/ui";
+import { TableSkeleton } from "@/components/skeletons";
 
 export const metadata: Metadata = { title: "Audit · Staff", robots: { index: false, follow: false } };
 
@@ -19,6 +21,10 @@ interface PageProps {
  * Domain audit view: members with totals plus the full append-only
  * scoring ledger for one member. Scope enforced server-side — a lead
  * can never list or open another domain's history.
+ *
+ * The domain resolution (required for scope gating) runs first; the
+ * members table and the optional ledger then stream in behind a
+ * Suspense boundary so the shell and domain pills paint immediately.
  */
 export default async function AdminAuditPage({ searchParams }: PageProps) {
   const ctx = await requireStaffPage();
@@ -42,45 +48,24 @@ export default async function AdminAuditPage({ searchParams }: PageProps) {
   const domainId = visible.some((d) => d.id === requestedDomain) ? requestedDomain! : visible[0]!.id;
   const domain = visible.find((d) => d.id === domainId)!;
 
-  const membersResult = await listDomainAuditMembers(ctx, domainId);
+  async function MembersAndLedger() {
+    const membersResult = await listDomainAuditMembers(ctx, domainId);
 
-  // Optional member drill-down.
-  let ledger: Awaited<ReturnType<typeof getMembershipLedger>> | null = null;
-  const memberIdParam = params.member;
-  if (memberIdParam && membersResult.ok) {
-    const membership = await prisma.domainMembership.findFirst({
-      where: { memberId: memberIdParam, domainId },
-      select: { id: true },
-    });
-    if (membership) {
-      ledger = await getMembershipLedger(ctx, membership.id);
+    // Optional member drill-down.
+    let ledger: Awaited<ReturnType<typeof getMembershipLedger>> | null = null;
+    const memberIdParam = params.member;
+    if (memberIdParam && membersResult.ok) {
+      const membership = await prisma.domainMembership.findFirst({
+        where: { memberId: memberIdParam, domainId },
+        select: { id: true },
+      });
+      if (membership) {
+        ledger = await getMembershipLedger(ctx, membership.id);
+      }
     }
-  }
 
-  return (
-    <AdminShell
-      title="Audit"
-      description="Members with total points and the append-only scoring history."
-      context={{
-        globalRole: ctx.globalRole === "PRESIDENT" || ctx.globalRole === "VICE_PRESIDENT" ? ctx.globalRole : null,
-        domains: visible.map((d) => ({ id: d.id, name: d.name })),
-      }}
-    >
-      <nav aria-label="Domains" className="flex flex-wrap gap-2">
-        {visible.map((d) => (
-          <Link
-            key={d.id}
-            href={`/admin/audit?domain=${d.id}`}
-            aria-current={d.id === domainId ? "page" : undefined}
-            className={`min-h-9 rounded-full border px-3 text-sm ${
-              d.id === domainId ? "border-accent bg-accent-soft font-semibold text-accent-dark" : "border-line bg-white text-muted hover:bg-surface"
-            }`}
-          >
-            {d.name}
-          </Link>
-        ))}
-      </nav>
-
+    return (
+      <>
       {!membersResult.ok ? (
         <Card>
           <p role="alert" className="text-sm text-danger">{membersResult.message}</p>
@@ -172,6 +157,43 @@ export default async function AdminAuditPage({ searchParams }: PageProps) {
           <p role="alert" className="text-sm text-danger">{ledger.message}</p>
         </Card>
       ) : null}
+      </>
+    );
+  }
+
+  return (
+    <AdminShell
+      title="Audit"
+      description="Members with total points and the append-only scoring history."
+      context={{
+        globalRole: ctx.globalRole === "PRESIDENT" || ctx.globalRole === "VICE_PRESIDENT" ? ctx.globalRole : null,
+        domains: visible.map((d) => ({ id: d.id, name: d.name })),
+      }}
+    >
+      <nav aria-label="Domains" className="flex flex-wrap gap-2">
+        {visible.map((d) => (
+          <Link
+            key={d.id}
+            href={`/admin/audit?domain=${d.id}`}
+            aria-current={d.id === domainId ? "page" : undefined}
+            className={`min-h-9 rounded-full border px-3 text-sm ${
+              d.id === domainId ? "border-accent bg-accent-soft font-semibold text-accent-dark" : "border-line bg-white text-muted hover:bg-surface"
+            }`}
+          >
+            {d.name}
+          </Link>
+        ))}
+      </nav>
+
+      <Suspense fallback={
+        <div aria-busy="true" aria-live="polite">
+          <p className="text-sm text-muted">Loading members and scoring history for {domain.name}…</p>
+          <div className="sr-only">Loading</div>
+          <TableSkeleton rows={6} cols={3} />
+        </div>
+      }>
+        <MembersAndLedger />
+      </Suspense>
     </AdminShell>
   );
 }

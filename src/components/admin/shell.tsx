@@ -1,4 +1,4 @@
-import Link from "next/link";
+import { PendingLink } from "@/components/nav-link";
 import { Activity, LayoutDashboard, ShieldCheck, Users } from "lucide-react";
 import { Logo } from "../ui";
 
@@ -8,48 +8,51 @@ export function AdminShell({
   context,
   title,
   description,
+  /** Optional pre-wrapped Suspense content replacing the domain list in the footer. */
+  footerRight,
 }: {
   children: React.ReactNode;
   context: { globalRole: "PRESIDENT" | "VICE_PRESIDENT" | null; domains: Array<{ id: string; name: string }> };
   title: string;
   description?: string;
+  footerRight?: React.ReactNode;
 }) {
   const global = context.globalRole !== null;
   return (
     <div className="mx-auto flex min-h-screen w-full max-w-6xl flex-col px-4 pb-16 sm:px-6">
       <header className="flex flex-wrap items-center justify-between gap-3 py-5">
-        <Link href="/admin/dashboard" className="flex items-center gap-3">
+        <PendingLink href="/admin/dashboard" className="flex items-center gap-3">
           <Logo height={32} />
           <span className="hidden text-xs font-medium uppercase tracking-wide text-faint sm:inline">Staff</span>
-        </Link>
+        </PendingLink>
         <nav aria-label="Admin" className="flex flex-wrap items-center gap-1 text-sm">
-          <Link
+          <PendingLink
             href="/admin/dashboard"
             className="inline-flex min-h-9 items-center gap-1.5 rounded-full px-3 font-medium text-muted hover:bg-surface hover:text-ink"
           >
             <LayoutDashboard size={14} aria-hidden="true" />
             Dashboard
-          </Link>
+          </PendingLink>
           {global ? (
             <>
-              <Link
+              <PendingLink
                 href="/admin/domains"
                 className="inline-flex min-h-9 items-center gap-1.5 rounded-full px-3 font-medium text-muted hover:bg-surface hover:text-ink"
               >
                 <Users size={14} aria-hidden="true" />
                 Domains
-              </Link>
-              <Link
+              </PendingLink>
+              <PendingLink
                 href="/admin/staff"
                 className="inline-flex min-h-9 items-center gap-1.5 rounded-full px-3 font-medium text-muted hover:bg-surface hover:text-ink"
               >
                 <ShieldCheck size={14} aria-hidden="true" />
                 Staff
-              </Link>
-              <Link href="/admin/activity" className="inline-flex min-h-9 items-center gap-1.5 rounded-full px-3 font-medium text-muted hover:bg-surface hover:text-ink">
+              </PendingLink>
+              <PendingLink href="/admin/activity" className="inline-flex min-h-9 items-center gap-1.5 rounded-full px-3 font-medium text-muted hover:bg-surface hover:text-ink">
                 <Activity size={14} aria-hidden="true" />
                 Activity
-              </Link>
+              </PendingLink>
             </>
           ) : null}
         </nav>
@@ -65,10 +68,9 @@ export function AdminShell({
 
       <footer className="mt-10 flex flex-wrap items-center justify-between gap-2 border-t border-line pt-4 text-xs text-faint">
         <span>{global ? "Leadership activity is recorded for oversight. " : "Signed in "} {new Date().toLocaleDateString("en-IN", { timeZone: "Asia/Kolkata" })} IST</span>
-        {context.domains.length > 0 ? (
+        {footerRight !== undefined ? footerRight : context.domains.length > 0 ? (
           <span className="hidden sm:inline">
-            Domains:{" "}
-            {context.domains.map((d, i) => (
+            Domains: {context.domains.map((d, i) => (
               <span key={d.id}>
                 {i > 0 ? " · " : ""}
                 {d.name}

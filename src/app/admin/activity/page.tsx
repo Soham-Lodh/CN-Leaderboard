@@ -12,8 +12,10 @@ export default async function LeadershipActivityPage({ searchParams }: { searchP
   const ctx = await requireGlobalStaffPage();
   const params = await searchParams;
   const selectedRole = roles.includes(params.role as (typeof roles)[number]) ? params.role! : "";
-  const domains = await prisma.domain.findMany({ orderBy: { name: "asc" }, select: { id: true, name: true } });
-  const events = await prisma.auditEvent.findMany({
+  // The domain list and the event page are independent reads.
+  const [domains, events] = await Promise.all([
+    prisma.domain.findMany({ orderBy: { name: "asc" }, select: { id: true, name: true } }),
+    prisma.auditEvent.findMany({
     where: {
       domainId: params.domain || undefined,
       ...(selectedRole === "PRESIDENT" || selectedRole === "VICE_PRESIDENT"
@@ -24,8 +26,9 @@ export default async function LeadershipActivityPage({ searchParams }: { searchP
     },
     orderBy: { createdAt: "desc" },
     take: 200,
-    select: { id: true, action: true, targetType: true, targetId: true, createdAt: true, domain: { select: { name: true } }, actorEmailSnapshot: true, metadata: true, beforeState: true, afterState: true },
-  });
+      select: { id: true, action: true, targetType: true, targetId: true, createdAt: true, domain: { select: { name: true } }, actorEmailSnapshot: true, metadata: true, beforeState: true, afterState: true },
+    }),
+  ]);
   return <AdminShell title="Leadership activity" description="All recorded work by Presidents, Vice Presidents, leads, and co-leads." context={{ globalRole: ctx.globalRole, domains: domains.map((d) => ({ id: d.id, name: d.name })) }}>
     <Card>
       <form className="grid gap-3 sm:grid-cols-[1fr_1fr_auto]" method="get">

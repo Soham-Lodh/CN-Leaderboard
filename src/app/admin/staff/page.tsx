@@ -18,12 +18,15 @@ export const metadata: Metadata = { title: "Staff · Admin", robots: { index: fa
 /** President/VP: provision staff, appoint/revoke roles. */
 export default async function AdminStaffPage() {
   const ctx = await requireGlobalStaffPage();
-  const overview = await listStaffOverview();
-  const domains = await prisma.domain.findMany({
-    where: { archivedAt: null },
-    orderBy: { name: "asc" },
-    select: { id: true, name: true },
-  });
+  // Independent reads: fetch concurrently instead of sequentially.
+  const [overview, domains] = await Promise.all([
+    listStaffOverview(),
+    prisma.domain.findMany({
+      where: { archivedAt: null },
+      orderBy: { name: "asc" },
+      select: { id: true, name: true },
+    }),
+  ]);
 
   const isSelf = (id: string) => id === ctx.staffAccountId;
 
